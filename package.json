@@ -1,0 +1,15 @@
+{
+  "name": "twelve-pilot",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently \"npm run dev:api\" \"npm run dev:web\"",
+    "dev:api": "cd backend && uvicorn app.main:app --reload --host 127.0.0.1 --port 8000",
+    "dev:web": "cd frontend && next dev -p 3000",
+    "build": "cd frontend && next build",
+    "lint": "cd frontend && next lint",
+    "typecheck": "cd frontend && tsc --noEmit"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
