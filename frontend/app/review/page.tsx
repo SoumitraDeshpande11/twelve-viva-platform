@@ -2,7 +2,7 @@
 
 import { FormEvent, useEffect, useState } from "react";
 import { Warning as AlertTriangle, CheckCircle as CheckCircle2, ArrowsClockwise as RefreshCcw, FloppyDisk as Save, ShieldWarning as ShieldAlert } from "@phosphor-icons/react";
-import { API_BASE, api, VivaSession } from "../../lib/api";
+import { API_BASE, api, getMe, logout, VivaSession } from "../../lib/api";
 import { AuthPanel } from "../AuthPanel";
 import { PageHeading } from "../../components/AppShell";
 import { Card, SectionTitle } from "../../components/ui/Card";
@@ -21,12 +21,15 @@ type ScoreReview = {
   created_at: string;
 };
 
+type Recording = { id: string; ref: string; size_bytes: number; created_at: string };
+
 type ReviewSession = VivaSession & {
   score_reviews?: ScoreReview[];
   rubric?: string;
+  recordings?: Recording[];
 };
 
-type Tab = "summary" | "answers" | "proctoring" | "transcript";
+type Tab = "summary" | "answers" | "proctoring" | "transcript" | "recording";
 
 export default function ReviewPage() {
   const [sessions, setSessions] = useState<VivaSession[]>([]);
@@ -34,6 +37,9 @@ export default function ReviewPage() {
   const [message, setMessage] = useState("");
   const [success, setSuccess] = useState("");
   const [needsAuth, setNeedsAuth] = useState(false);
+  // Why auth is needed: "none" = not signed in, "student" = signed in as a student
+  // (review is staff-only, so they must switch). Drives a clear message vs a bare login.
+  const [authReason, setAuthReason] = useState<"none" | "student">("none");
   const [tab, setTab] = useState<Tab>("summary");
   const [refreshing, setRefreshing] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -65,8 +71,32 @@ export default function ReviewPage() {
   }
 
   useEffect(() => {
-    api("/api/auth/me").then(() => loadSessions()).catch(() => setNeedsAuth(true));
+    // Review is staff-only. Distinguish "not signed in" from "signed in as a student"
+    // (the common case after testing the viva) so the page explains the fix instead of
+    // showing an empty list or a confusing bare login.
+    getMe()
+      .then((me) => {
+        if (me.role === "staff") {
+          loadSessions().catch((error) => setMessage(error.message));
+        } else {
+          setAuthReason("student");
+          setNeedsAuth(true);
+        }
+      })
+      .catch(() => {
+        setAuthReason("none");
+        setNeedsAuth(true);
+      });
   }, []);
+
+  async function signOutToSwitch() {
+    try {
+      await logout();
+    } catch {
+      // best-effort; the AuthPanel login below will overwrite the cookie regardless.
+    }
+    setAuthReason("none");
+  }
 
   async function selectSession(sessionId: string) {
     setMessage("");
@@ -152,12 +182,26 @@ export default function ReviewPage() {
 
   if (needsAuth) {
     return (
-      <AuthPanel
-        onReady={() => {
-          setNeedsAuth(false);
-          loadSessions().catch((error) => setMessage(error.message));
-        }}
-      />
+      <div className="flex flex-col gap-4">
+        {authReason === "student" && (
+          <Banner tone="warn">
+            <p className="font-medium">You&apos;re signed in as a student.</p>
+            <p className="mt-0.5">
+              Review is for staff only. Sign in with a staff account below to see viva
+              sessions — that replaces the student session in this browser.
+            </p>
+            <Button size="sm" variant="secondary" className="mt-2.5" onClick={signOutToSwitch}>
+              Sign out of student session
+            </Button>
+          </Banner>
+        )}
+        <AuthPanel
+          onReady={() => {
+            setNeedsAuth(false);
+            loadSessions().catch((error) => setMessage(error.message));
+          }}
+        />
+      </div>
     );
   }
 
@@ -275,6 +319,7 @@ export default function ReviewPage() {
                     { value: "summary", label: "Summary" },
                     { value: "answers", label: "Answers" },
                     { value: "proctoring", label: "Proctoring" },
+                    { value: "recording", label: "Recording" },
                     { value: "transcript", label: "Transcript" },
                   ]}
                 />
@@ -489,6 +534,37 @@ export default function ReviewPage() {
                   })()}
                 </Card>
               </div>
+            )}
+
+            {tab === "recording" && (
+              <Card className="p-6">
+                <SectionTitle
+                  marker="№ —"
+                  title="Viva recording"
+                  hint="Camera video + audio for the whole viva. Review-only — never scored."
+                />
+                <div className="mt-5 flex flex-col gap-4">
+                  {selected.recordings?.length ? (
+                    selected.recordings.map((rec) => (
+                      <div key={rec.id}>
+                        <video
+                          controls
+                          preload="metadata"
+                          aria-label="Viva camera recording"
+                          src={`${API_BASE}/api/review/recording?ref=${encodeURIComponent(rec.ref)}`}
+                          className="w-full rounded-[var(--radius-control)] border border-line bg-ink"
+                        />
+                        <p className="mt-1.5 text-[0.7rem] text-muted">
+                          {new Date(rec.created_at).toLocaleString()} ·{" "}
+                          {(rec.size_bytes / (1024 * 1024)).toFixed(1)} MB
+                        </p>
+                      </div>
+                    ))
+                  ) : (
+                    <p className="text-[0.82rem] text-muted">No recording was captured for this viva.</p>
+                  )}
+                </div>
+              </Card>
             )}
 
             {tab === "transcript" && (

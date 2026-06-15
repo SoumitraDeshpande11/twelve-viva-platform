@@ -69,7 +69,12 @@ export function useMediaCapture(logEvent: LogEvent, notify: (message: string) =>
       return null;
     }
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        // 720p ideal so the review recording is sharp enough to read a face, while still
+        // falling back gracefully if the camera can't hit it.
+        video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: true,
+      });
       cameraStreamRef.current = stream;
       if (videoRef.current) videoRef.current.srcObject = stream;
       stream.getAudioTracks().forEach((track) => {

@@ -1,9 +1,30 @@
 # Spec: Student login/logout & session switching
 
-Status: **Draft — not implemented**
+Status: **Implemented** (core + signposting; optional `me` enrichment 5.4 deferred)
 Owner: TBD
 Branch: `feat/audit-fixes`
 Date: 2026-06-15
+
+## Implementation notes (2026-06-16)
+
+Resolved open questions and what shipped:
+
+1. **Mid-viva logout → resumable** (open Q1 default kept): logout never auto-finalizes;
+   the attempt row stays `active`. Recovery when the one-time code is consumed is the
+   admin reset-attempt path.
+2. **Plain chip, no `me` enrichment** (open Q2): header shows a static `Student attempt`
+   chip; `GET /api/auth/me` is unchanged for students (5.4 deferred).
+3. **Idle/timeout logout** (open Q3): out of scope; possible follow-up.
+
+Shipped:
+- Backend `POST /api/auth/logout` now writes a `student_logout` / `staff_logout`
+  audit event and returns `{ ok, role }`; role-agnostic delete-and-clear behaviour
+  is otherwise unchanged. Covered by `tests/test_api.py` (`test_student_logout_*`,
+  `test_staff_logout_audits`, `test_logout_without_session_is_noop`).
+- Frontend `AppShell`: `Student attempt` chip + `End session` with a confirm popover
+  (redirects to `/student`); staff get a `Test as student` button (logs out → `/student`).
+- Frontend `/student`: a staff cookie shows a "log out to take a viva" notice with a
+  one-click logout instead of letting the start call 403.
 
 ## 1. Problem
 

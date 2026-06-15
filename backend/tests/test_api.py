@@ -472,3 +472,260 @@ def TestClientNew():
     from fastapi.testclient import TestClient
 
     return TestClient(main.app)
+
+
+# --- logout / session switching (auth-login-logout-spec) ---------------------
+
+def audit_events(event_type):
+    with main.connect() as conn:
+        return [main.row_to_dict(r) for r in conn.execute(
+            "SELECT * FROM security_audit_events WHERE event_type = ? ORDER BY created_at", (event_type,)
+        )]
+
+
+def test_student_logout_clears_session_and_audits(client, fresh_client):
+    csrf = bootstrap(client)
+    exam = create_exam(client, csrf).json()
+    start = start_attempt(fresh_client, exam["id"], exam["students"][0]["token"]).json()
+    scsrf = start["csrf_token"]
+    # An active student attempt is visible via me.
+    assert fresh_client.get("/api/auth/me").json()["role"] == "student"
+    r = fresh_client.post("/api/auth/logout", headers={"X-CSRF-Token": scsrf})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"ok": True, "role": "student"}
+    # Session row is gone: me now 401, and the attempt requires a fresh code to restart.
+    assert fresh_client.get("/api/auth/me").status_code == 401
+    events = audit_events("student_logout")
+    assert len(events) == 1
+    assert events[0]["actor_type"] == "student"
+
+
+def test_staff_logout_audits(client):
+    csrf = bootstrap(client)
+    r = client.post("/api/auth/logout", headers={"X-CSRF-Token": csrf})
+    assert r.status_code == 200, r.text
+    assert r.json()["role"] == "staff"
+    assert client.get("/api/auth/me").status_code == 401
+    events = audit_events("staff_logout")
+    assert len(events) == 1
+    assert events[0]["actor_type"] == "staff"
+
+
+def test_transcription_falls_back_to_draft_on_provider_error(monkeypatch):
+    """A transient provider failure (e.g. 503) degrades to the browser draft in dev,
+    instead of failing the answer."""
+    from pathlib import Path
+    from app import transcription as t
+
+    monkeypatch.setenv("TWELVE_TRANSCRIPTION_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "x")
+
+    def boom(*_a, **_k):
+        raise t.TranscriptionError("Server error '503 Service Unavailable'")
+
+    monkeypatch.setattr(t, "transcribe_with_gemini", boom)
+    out = t.transcribe_audio(Path("x.wav"), "audio/wav", draft_transcript="hello world")
+    assert out["status"] == "draft_used"
+    assert out["text"] == "hello world"
+    assert "failed-local-fallback" in out["provider"]
+    assert "503" in out["error"]
+
+
+def test_transcription_falls_back_without_draft_in_dev(monkeypatch):
+    """A provider 429 with no browser draft still degrades locally (empty text) rather
+    than surfacing the raw provider error to the student."""
+    from pathlib import Path
+    from app import transcription as t
+
+    monkeypatch.setenv("TWELVE_TRANSCRIPTION_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "x")
+
+    def boom(*_a, **_k):
+        raise t.TranscriptionError("Client error '429 Too Many Requests'")
+
+    monkeypatch.setattr(t, "transcribe_with_gemini", boom)
+    out = t.transcribe_audio(Path("x.wav"), "audio/wav", draft_transcript=None)
+    assert out["status"] == "draft_used"
+    assert out["text"] == ""
+    assert "failed-local-fallback" in out["provider"]
+    assert "429" in out["error"]
+
+
+def test_transcription_reraises_provider_error_in_prod(monkeypatch):
+    """In staging/prod a provider failure must NOT silently substitute a draft."""
+    from pathlib import Path
+    from app import transcription as t
+
+    monkeypatch.setenv("TWELVE_TRANSCRIPTION_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "x")
+    monkeypatch.setenv("TWELVE_ENV", "production")
+
+    def boom(*_a, **_k):
+        raise t.TranscriptionError("503")
+
+    monkeypatch.setattr(t, "transcribe_with_gemini", boom)
+    import pytest as _pytest
+    with _pytest.raises(t.TranscriptionError):
+        t.transcribe_audio(Path("x.wav"), "audio/wav", draft_transcript="hello")
+
+
+# --- viva video recording (viva-video-recording-spec) ------------------------
+
+def upload_recording(sc, scsrf, data=b"fake-webm-bytes"):
+    return sc.post(
+        "/api/student/attempts/current/recording",
+        files={"recording": ("viva.webm", data, "video/webm")},
+        headers={"X-CSRF-Token": scsrf},
+    )
+
+
+def test_upload_recording_stores_row_file_and_review_can_play(client, fresh_client):
+    from pathlib import Path
+
+    csrf = bootstrap(client)
+    exam = create_exam(client, csrf).json()
+    start = start_attempt(fresh_client, exam["id"], exam["students"][0]["token"]).json()
+    session_id = start["id"]
+    r = upload_recording(fresh_client, start["csrf_token"])
+    assert r.status_code == 200, r.text
+    rid = r.json()["recording_id"]
+
+    with main.connect() as conn:
+        row = main.row_to_dict(
+            conn.execute("SELECT * FROM session_recordings WHERE id = ?", (rid,)).fetchone()
+        )
+    assert row and row["session_id"] == session_id
+    assert Path(row["storage_path"]).exists()
+
+    # Review detail exposes the recording, and staff can stream it back.
+    detail = client.get(f"/api/review/sessions/{session_id}").json()
+    assert any(rec["id"] == rid for rec in detail["recordings"])
+    got = client.get("/api/review/recording", params={"ref": row["storage_path"]})
+    assert got.status_code == 200
+    assert got.headers["content-type"].startswith("video/webm")
+
+
+def test_upload_recording_rejects_too_large(client, fresh_client, monkeypatch):
+    monkeypatch.setenv("TWELVE_MAX_VIDEO_BYTES", "10")
+    csrf = bootstrap(client)
+    exam = create_exam(client, csrf).json()
+    start = start_attempt(fresh_client, exam["id"], exam["students"][0]["token"]).json()
+    r = upload_recording(fresh_client, start["csrf_token"], data=b"x" * 100)
+    assert r.status_code == 413
+
+
+def test_upload_recording_rejected_when_not_active(client, fresh_client):
+    csrf, exam_id, session_id = setup_completed_session(client, fresh_client)
+    scsrf = fresh_client.get("/api/auth/me").json()["csrf_token"]
+    r = upload_recording(fresh_client, scsrf)
+    assert r.status_code == 409
+
+
+def test_review_recording_rejects_out_of_jail_and_missing(client):
+    bootstrap(client)
+    # A ref outside UPLOAD_DIR is refused outright.
+    assert client.get("/api/review/recording", params={"ref": "/etc/passwd"}).status_code == 403
+    # A ref inside UPLOAD_DIR but with no file is a 404.
+    missing = str(main.UPLOAD_DIR / "recordings" / "nope" / "x.webm")
+    assert client.get("/api/review/recording", params={"ref": missing}).status_code == 404
+
+
+def test_review_recording_requires_staff(client, fresh_client):
+    csrf = bootstrap(client)
+    exam = create_exam(client, csrf).json()
+    start = start_attempt(fresh_client, exam["id"], exam["students"][0]["token"]).json()
+    upload_recording(fresh_client, start["csrf_token"])
+    with main.connect() as conn:
+        ref = conn.execute("SELECT storage_path FROM session_recordings LIMIT 1").fetchone()[0]
+    # The student (fresh_client) must not be able to stream recordings.
+    assert fresh_client.get("/api/review/recording", params={"ref": ref}).status_code in (401, 403)
+
+
+def test_exam_delete_removes_recording_files(client, fresh_client):
+    from pathlib import Path
+
+    csrf = bootstrap(client)
+    exam = create_exam(client, csrf).json()
+    exam_id = exam["id"]
+    start = start_attempt(fresh_client, exam_id, exam["students"][0]["token"]).json()
+    upload_recording(fresh_client, start["csrf_token"])
+    with main.connect() as conn:
+        path = conn.execute("SELECT storage_path FROM session_recordings LIMIT 1").fetchone()[0]
+    assert Path(path).exists()
+
+    assert client.delete(f"/api/admin/exams/{exam_id}", headers={"X-CSRF-Token": csrf}).status_code == 204
+    assert not Path(path).exists()
+    with main.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM session_recordings").fetchone()[0] == 0
+
+
+# --- local providers: Ollama LLM + faster-whisper STT ------------------------
+
+EXAM_STUB = {"name": "E", "problem_statement": "p", "curriculum": "c", "rubric": "Correctness 50, depth 50"}
+Q_STUB = {"category": "core-subject", "text": "q", "expected_points": ["x"]}
+
+
+def test_ollama_provider_scores_via_dispatcher(monkeypatch):
+    monkeypatch.setenv("TWELVE_AI_PROVIDER", "ollama")
+    monkeypatch.setattr(
+        main, "score_answer_with_ollama",
+        lambda *a, **k: {"score": 7.0, "max_score": 10.0, "reasoning": "solid"},
+    )
+    result, provider, err = main.score_current_answer(Q_STUB, "an answer", EXAM_STUB)
+    assert provider == "ollama"
+    assert result["score"] == 7.0 and result["status"] == "scored"
+    assert err is None
+
+
+def test_ollama_error_falls_back_to_local(monkeypatch):
+    monkeypatch.setenv("TWELVE_AI_PROVIDER", "ollama")
+
+    def boom(*_a, **_k):
+        raise main.OllamaAgentError("ollama down")
+
+    monkeypatch.setattr(main, "score_answer_with_ollama", boom)
+    result, provider, err = main.score_current_answer(Q_STUB, LONG_ANSWER, EXAM_STUB)
+    assert provider == "local-fallback"
+    assert result["status"] == "scored"
+    assert "ollama down" in err
+
+
+def test_whisper_transcription_via_dispatcher(monkeypatch):
+    from pathlib import Path
+    from app import transcription as t
+
+    monkeypatch.setenv("TWELVE_TRANSCRIPTION_PROVIDER", "whisper")
+    monkeypatch.setattr(t, "whisper_transcription_configured", lambda: True)
+    monkeypatch.setattr(
+        t, "transcribe_with_whisper",
+        lambda _p: {"status": "transcribed", "text": "hello there", "provider": "faster-whisper", "model": "base", "error": None},
+    )
+    out = t.transcribe_audio(Path("x.webm"), "audio/webm")
+    assert out["provider"] == "faster-whisper"
+    assert out["text"] == "hello there"
+
+
+def test_whisper_error_falls_back_to_draft(monkeypatch):
+    from pathlib import Path
+    from app import transcription as t
+
+    monkeypatch.setenv("TWELVE_TRANSCRIPTION_PROVIDER", "whisper")
+    monkeypatch.setattr(t, "whisper_transcription_configured", lambda: True)
+
+    def boom(_p):
+        raise t.TranscriptionError("whisper boom")
+
+    monkeypatch.setattr(t, "transcribe_with_whisper", boom)
+    out = t.transcribe_audio(Path("x.webm"), "audio/webm", draft_transcript="draft text")
+    assert out["status"] == "draft_used"
+    assert out["text"] == "draft text"
+    assert "whisper-failed-local-fallback" in out["provider"]
+
+
+def test_logout_without_session_is_noop(client):
+    # No cookie -> role is null, no audit row, still clears cookies cleanly.
+    r = client.post("/api/auth/logout")
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "role": None}
+    assert audit_events("staff_logout") == []
+    assert audit_events("student_logout") == []

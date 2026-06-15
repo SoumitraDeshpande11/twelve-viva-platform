@@ -4,6 +4,7 @@ import os
 import secrets
 import hashlib
 import hmac
+import shutil
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -45,6 +46,14 @@ from .gemini_agent import (
     score_answer_with_gemini,
 )
 from .gemini_voice import GeminiVoiceError, create_live_ephemeral_token, gemini_tts_configured, synthesize_question_wav
+from .ollama_agent import (
+    OllamaAgentError,
+    build_question_plan_with_ollama,
+    create_followup_with_ollama,
+    ollama_configured,
+    ollama_model,
+    score_answer_with_ollama,
+)
 from .openai_agent import (
     OpenAIAgentError,
     build_question_plan_with_openai,
@@ -152,6 +161,7 @@ def health() -> dict[str, Any]:
         "gemini_configured": gemini_configured(),
         "gemini_tts_configured": gemini_tts_configured(),
         "transcription_provider": transcription_provider(),
+        "ollama_model": ollama_model() if selected_ai_provider() == "ollama" else None,
     }
 
 
@@ -252,12 +262,23 @@ def enforce_login_rate_limit(conn: Any, email_key: str, ip_key: str) -> None:
 @app.post("/api/auth/logout")
 def logout(request: Request, response: Response) -> dict[str, Any]:
     token = request.cookies.get(AUTH_COOKIE)
+    role: str | None = None
     with connect() as conn:
         if token:
+            session = row_to_dict(
+                conn.execute("SELECT * FROM auth_sessions WHERE token_hash = ?", (hash_opaque_token(token),)).fetchone()
+            )
+            if session:
+                role = session["role"]
+                # Record deliberate session ends so we retain an audit trail of who
+                # logged out (and when) — important on shared/lab machines. Role-agnostic
+                # behaviour is preserved; this only adds the event.
+                actor_id = session.get("student_id") if role == "student" else session.get("user_id")
+                audit_event(conn, role, actor_id, f"{role}_logout", {"session_id": session["id"]})
             conn.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (hash_opaque_token(token),))
     response.delete_cookie(AUTH_COOKIE, path="/")
     response.delete_cookie(CSRF_COOKIE, path="/")
-    return {"ok": True}
+    return {"ok": True, "role": role}
 
 
 @app.get("/api/auth/me")
@@ -422,10 +443,16 @@ def delete_exam(exam_id: str, request: Request) -> Response:
     with connect() as conn:
         if not conn.execute("SELECT 1 FROM exams WHERE id = ?", (exam_id,)).fetchone():
             raise HTTPException(status_code=404, detail="Exam not found")
+        # Collect session ids first so we can remove their on-disk media after the cascade.
+        session_ids = [row["id"] for row in conn.execute("SELECT id FROM viva_sessions WHERE exam_id = ?", (exam_id,))]
         # FK ON DELETE CASCADE (PRAGMA foreign_keys=ON in storage.connect) removes the
-        # exam's students, sessions, answers, questions, transcript/proctoring/audio rows.
+        # exam's students, sessions, answers, questions, transcript/proctoring/audio/recording rows.
         conn.execute("DELETE FROM exams WHERE id = ?", (exam_id,))
         audit_event(conn, "staff", auth["user_id"], "exam_deleted", {"exam_id": exam_id})
+    # The DB rows cascade, but the recorded files do not — remove the per-session dirs.
+    for session_id in session_ids:
+        shutil.rmtree(UPLOAD_DIR / "recordings" / session_id, ignore_errors=True)
+        shutil.rmtree(UPLOAD_DIR / "audio" / session_id, ignore_errors=True)
     return Response(status_code=204)
 
 
@@ -848,6 +875,60 @@ async def upload_current_audio(request: Request, audio: UploadFile = File(...)) 
     if isinstance(audio_file, UploadFile):
         audio = audio_file
     return await upload_audio_for_session(auth["viva_session_id"], audio, draft_transcript)
+
+
+@app.post("/api/sessions/{session_id}/recording")
+async def upload_recording(session_id: str, request: Request, recording: UploadFile = File(...)) -> dict[str, Any]:
+    require_session_access(request, session_id, student_only=True)
+    return await store_session_recording(session_id, recording)
+
+
+@app.post("/api/student/attempts/current/recording")
+async def upload_current_recording(request: Request, recording: UploadFile = File(...)) -> dict[str, Any]:
+    auth = require_student_attempt(request)
+    form = await request.form()
+    file = form.get("recording")
+    if isinstance(file, UploadFile):
+        recording = file
+    return await store_session_recording(auth["viva_session_id"], recording)
+
+
+async def store_session_recording(session_id: str, recording: UploadFile) -> dict[str, Any]:
+    """Persist the full-viva webcam recording for examiner review (review-only, never scored)."""
+    with connect() as conn:
+        session = row_to_dict(conn.execute("SELECT * FROM viva_sessions WHERE id = ?", (session_id,)).fetchone())
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if session["status"] != "active":
+            raise HTTPException(status_code=409, detail="Session is not active")
+    content = await recording.read()
+    max_bytes = int(os.getenv("TWELVE_MAX_VIDEO_BYTES", str(500 * 1024 * 1024)))
+    if len(content) > max_bytes:
+        raise HTTPException(status_code=413, detail="Recording upload is too large.")
+    if not content:
+        raise HTTPException(status_code=400, detail="Recording is empty.")
+    recording_dir = UPLOAD_DIR / "recordings" / session_id
+    recording_dir.mkdir(parents=True, exist_ok=True)
+    extension = Path(recording.filename or "viva.webm").suffix or ".webm"
+    storage_path = recording_dir / f"{uuid.uuid4()}{extension}"
+    storage_path.write_bytes(content)
+    recording_id = str(uuid.uuid4())
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO session_recordings (id, session_id, storage_path, mime_type, size_bytes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (recording_id, session_id, str(storage_path), recording.content_type, len(content), now),
+        )
+        log_transcript(
+            conn,
+            session_id,
+            "recording_uploaded",
+            {"recording_id": recording_id, "mime_type": recording.content_type, "size_bytes": len(content)},
+        )
+    return {"recording_id": recording_id, "size_bytes": len(content)}
 
 
 async def upload_audio_for_session(session_id: str, audio: UploadFile, draft_transcript: str = "") -> dict[str, Any]:
@@ -1318,6 +1399,18 @@ def review_audio(ref: str, request: Request) -> FileResponse:
     return FileResponse(path, media_type="audio/webm", filename=path.name)
 
 
+@app.get("/api/review/recording")
+def review_recording(ref: str, request: Request) -> FileResponse:
+    require_staff(request, {"super_admin", "examiner", "invigilator"})
+    path = Path(ref).resolve()
+    upload_root = UPLOAD_DIR.resolve()
+    if upload_root not in path.parents:
+        raise HTTPException(status_code=403, detail="Recording reference is not available.")
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Recording not found.")
+    return FileResponse(path, media_type="video/webm", filename=path.name)
+
+
 @app.post("/api/realtime/token")
 async def realtime_token(request: Request) -> dict[str, Any]:
     require_provider_token_access(request)
@@ -1583,6 +1676,11 @@ def make_question_plan(exam: dict[str, Any], student: dict[str, Any], submission
             return build_question_plan_with_gemini(exam, student, submission_text), "gemini", None
         except GeminiAgentError as exc:
             return build_question_plan(exam, student, submission_text), "local-fallback", str(exc)
+    if provider == "ollama":
+        try:
+            return build_question_plan_with_ollama(exam, student, submission_text), "ollama", None
+        except OllamaAgentError as exc:
+            return build_question_plan(exam, student, submission_text), "local-fallback", str(exc)
     return build_question_plan(exam, student, submission_text), "local", None
 
 
@@ -1614,6 +1712,19 @@ def score_current_answer(question: dict[str, Any], answer_text: str, exam: dict[
                 result["model"] = "local"
                 return result, "local-fallback", str(exc)
             return pending_ai_error_result(str(exc)), "gemini", str(exc)
+    if provider == "ollama":
+        try:
+            result = score_answer_with_ollama(question, answer_text, exam["rubric"], exam)
+            result["status"] = "scored"
+            result["model"] = ollama_model()
+            return result, "ollama", None
+        except OllamaAgentError as exc:
+            if local_ai_allowed():
+                result = score_answer(question, answer_text, exam["rubric"])
+                result["status"] = "scored"
+                result["model"] = "local"
+                return result, "local-fallback", str(exc)
+            return pending_ai_error_result(str(exc)), "ollama", str(exc)
     result = score_answer(question, answer_text, exam["rubric"])
     result["status"] = "scored"
     result["model"] = "local"
@@ -1663,6 +1774,11 @@ def create_next_followup(question: dict[str, Any], answer_text: str, exam: dict[
             return create_followup_with_gemini(question, answer_text, exam["rubric"]), "gemini", None
         except GeminiAgentError as exc:
             return create_followup(question, answer_text), "local-fallback", str(exc)
+    if provider == "ollama":
+        try:
+            return create_followup_with_ollama(question, answer_text, exam["rubric"]), "ollama", None
+        except OllamaAgentError as exc:
+            return create_followup(question, answer_text), "local-fallback", str(exc)
     return create_followup(question, answer_text), "local", None
 
 
@@ -1674,6 +1790,8 @@ def selected_ai_provider() -> str:
         return "openai" if openai_configured() else "local"
     if provider == "gemini":
         return "gemini" if gemini_configured() else "local"
+    if provider == "ollama":
+        return "ollama" if ollama_configured() else "local"
     if openai_configured():
         return "openai"
     if gemini_configured():
@@ -1808,6 +1926,20 @@ def hydrate_session(conn: Any, session_id: str, include_private: bool = False) -
     session["proctoring_events"] = proctoring
     session["transcript_events"] = transcript
     session["audio_submissions"] = audio_submissions
+    # Webcam recordings are staff-review-only; never expose the refs to the student.
+    session["recordings"] = (
+        rows_to_dicts(
+            conn.execute(
+                """
+                SELECT id, storage_path AS ref, mime_type, size_bytes, created_at
+                FROM session_recordings WHERE session_id = ? ORDER BY created_at
+                """,
+                (session_id,),
+            )
+        )
+        if include_private
+        else []
+    )
     session["rubric"] = session["rubric"] if include_private else None
     # Deterministic tie-break (created_at, rowid) so reviews[-1] is the same newest
     # override that latest_override resolves to for the list endpoints.

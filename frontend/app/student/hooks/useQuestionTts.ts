@@ -11,6 +11,8 @@ import { LogLiveTurn } from "../types";
  */
 export function useQuestionTts(session: VivaSession | null, logLiveTurnEvent: LogLiveTurn) {
   const [speaking, setSpeaking] = useState(false);
+  // Whether playback is currently paused (server <audio> or browser speechSynthesis).
+  const [paused, setPaused] = useState(false);
   const sessionRef = useRef<VivaSession | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   // Object URL backing the current TTS <audio>; revoked on replace/ended to avoid leaks.
@@ -39,9 +41,13 @@ export function useQuestionTts(session: VivaSession | null, logLiveTurnEvent: Lo
       window.speechSynthesis.cancel();
       const utterance = new SpeechSynthesisUtterance(text);
       utterance.rate = 0.92;
-      utterance.onstart = () => setSpeaking(true);
+      utterance.onstart = () => {
+        setSpeaking(true);
+        setPaused(false);
+      };
       utterance.onend = () => {
         setSpeaking(false);
+        setPaused(false);
         if (questionId) void logLiveTurnEvent("tts_completed", questionId, { provider: "browser" });
       };
       window.speechSynthesis.speak(utterance);
@@ -52,6 +58,7 @@ export function useQuestionTts(session: VivaSession | null, logLiveTurnEvent: Lo
   const speakQuestion = useCallback(
     async (question: VivaQuestion) => {
       setSpeaking(true);
+      setPaused(false);
       window.speechSynthesis?.cancel();
       releaseAudio();
 
@@ -71,11 +78,13 @@ export function useQuestionTts(session: VivaSession | null, logLiveTurnEvent: Lo
             audioUrlRef.current = url;
             audio.onended = () => {
               setSpeaking(false);
+              setPaused(false);
               releaseAudio();
               void logLiveTurnEvent("tts_completed", question.id, { provider: "gemini" });
             };
             audio.onerror = () => {
               setSpeaking(false);
+              setPaused(false);
               releaseAudio();
               speakWithBrowser(question.text, question.id);
             };
@@ -91,5 +100,30 @@ export function useQuestionTts(session: VivaSession | null, logLiveTurnEvent: Lo
     [logLiveTurnEvent, releaseAudio, speakWithBrowser]
   );
 
-  return { speaking, speakQuestion };
+  /** Pause/resume the current question audio (server <audio> or browser speech). */
+  const togglePlayback = useCallback(() => {
+    const audio = audioRef.current;
+    if (audio) {
+      if (audio.paused) {
+        void audio.play();
+        setPaused(false);
+      } else {
+        audio.pause();
+        setPaused(true);
+      }
+      return;
+    }
+    const synth = window.speechSynthesis;
+    if (synth?.speaking) {
+      if (synth.paused) {
+        synth.resume();
+        setPaused(false);
+      } else {
+        synth.pause();
+        setPaused(true);
+      }
+    }
+  }, []);
+
+  return { speaking, paused, speakQuestion, togglePlayback };
 }

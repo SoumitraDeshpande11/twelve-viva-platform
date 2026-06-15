@@ -18,6 +18,8 @@ def transcription_provider() -> str:
     provider = os.getenv("TWELVE_TRANSCRIPTION_PROVIDER", "auto").strip().lower()
     if provider == "local":
         return "local"
+    if provider in {"whisper", "faster-whisper", "local-whisper"}:
+        return "whisper" if whisper_transcription_configured() else "local"
     if provider == "openai":
         return "openai" if openai_transcription_configured() else "local"
     if provider == "gemini":
@@ -37,13 +39,80 @@ def gemini_transcription_configured() -> bool:
     return bool(os.getenv("GEMINI_API_KEY"))
 
 
+def whisper_transcription_configured() -> bool:
+    # Local STT via faster-whisper. Available iff the package imports (model downloads on
+    # first use). No API key or network needed at request time after the first download.
+    try:
+        import faster_whisper  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+_WHISPER_MODEL: Any = None
+
+
+def _whisper_model() -> Any:
+    """Lazy-load and cache the faster-whisper model (loading is expensive)."""
+    global _WHISPER_MODEL
+    if _WHISPER_MODEL is None:
+        from faster_whisper import WhisperModel
+
+        size = os.getenv("WHISPER_MODEL", "base")
+        device = os.getenv("WHISPER_DEVICE", "cpu")
+        compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+        _WHISPER_MODEL = WhisperModel(size, device=device, compute_type=compute_type)
+    return _WHISPER_MODEL
+
+
+def transcribe_with_whisper(path: Path) -> dict[str, Any]:
+    try:
+        model = _whisper_model()
+        segments, _info = model.transcribe(str(path), language=os.getenv("WHISPER_LANGUAGE", "en"))
+        text = "".join(segment.text for segment in segments).strip()
+    except Exception as exc:  # model load / decode failure
+        raise TranscriptionError(f"Whisper transcription failed: {exc}") from exc
+    if not text:
+        raise TranscriptionError("Whisper transcription returned empty text")
+    return {
+        "status": "transcribed",
+        "text": text,
+        "provider": "faster-whisper",
+        "model": os.getenv("WHISPER_MODEL", "base"),
+        "error": None,
+    }
+
+
+def _local_allowed() -> bool:
+    return os.getenv("TWELVE_ENV", "local").strip().lower() in {"local", "development", "test"}
+
+
 def transcribe_audio(path: Path, mime_type: str | None, draft_transcript: str | None = None) -> dict[str, Any]:
     provider = transcription_provider()
-    if provider == "openai":
-        return transcribe_with_openai(path, mime_type)
-    if provider == "gemini":
-        return transcribe_with_gemini(path, mime_type)
-    if draft_transcript and os.getenv("TWELVE_ENV", "local").strip().lower() in {"local", "development", "test"}:
+    if provider in {"openai", "gemini", "whisper"}:
+        try:
+            if provider == "openai":
+                return transcribe_with_openai(path, mime_type)
+            if provider == "whisper":
+                return transcribe_with_whisper(path)
+            return transcribe_with_gemini(path, mime_type)
+        except TranscriptionError as exc:
+            # Provider unavailable (e.g. a transient 503 / 429 rate limit). In local/dev/test
+            # degrade to the local transcript (the browser draft) so a viva is never blocked
+            # by a flaky or quota-limited provider — with or without a draft. An empty draft
+            # is acceptable here; the professor reviews. In staging/prod we re-raise so the
+            # caller records the error for review and never silently substitutes marks
+            # (mirrors the AI-scoring fallback invariant).
+            if _local_allowed():
+                return {
+                    "status": "draft_used",
+                    "text": (draft_transcript or "").strip(),
+                    "provider": f"{provider}-failed-local-fallback",
+                    "model": "browser-speech-recognition",
+                    "error": str(exc),
+                }
+            raise
+    if draft_transcript and _local_allowed():
         return {
             "status": "draft_used",
             "text": draft_transcript.strip(),

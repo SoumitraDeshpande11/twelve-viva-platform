@@ -28,14 +28,32 @@ export function useProctoring({
   useEffect(() => {
     if (!active) return;
 
-    const onVisibility = () => {
-      if (document.hidden) logEvent("tab_hidden", { state: "hidden" }, 1, undefined, "high");
+    // Collapse rapid repeats of the same flag (e.g. a tab-switch fires blur AND
+    // visibilitychange, and fidgeting can fire either many times a second). We keep
+    // distinct event types but throttle identical ones so one action ≈ one flag.
+    const lastFlag: Record<string, number> = {};
+    const FLAG_THROTTLE_MS = 4000;
+    const flag = (
+      type: string,
+      payload: Record<string, unknown>,
+      confidence: number,
+      ttl: number | undefined,
+      severity: "info" | "warning" | "high"
+    ) => {
+      const now = performance.now();
+      if (now - (lastFlag[type] ?? -Infinity) < FLAG_THROTTLE_MS) return;
+      lastFlag[type] = now;
+      void logEvent(type, payload, confidence, ttl, severity);
     };
-    const onBlur = () => logEvent("window_blur", { state: "blurred" }, 0.9, undefined, "warning");
+
+    const onVisibility = () => {
+      if (document.hidden) flag("tab_hidden", { state: "hidden" }, 1, undefined, "high");
+    };
+    const onBlur = () => flag("window_blur", { state: "blurred" }, 0.9, undefined, "warning");
     const onFullscreen = () => {
       const isActive = Boolean(document.fullscreenElement);
       onFullscreenChange(isActive);
-      if (!isActive) logEvent("fullscreen_exit", {}, 1, undefined, "high");
+      if (!isActive) flag("fullscreen_exit", {}, 1, undefined, "high");
     };
 
     async function analyzeCamera() {

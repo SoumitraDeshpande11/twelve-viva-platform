@@ -1,4 +1,29 @@
-export const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000";
+const CONFIGURED_API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000";
+
+/**
+ * In local dev, target the SAME host the user is browsing (localhost vs 127.0.0.1)
+ * rather than the hardcoded one. Otherwise the page (e.g. localhost:3000) and the API
+ * (127.0.0.1:8000) are different "sites", so the SameSite=Lax auth cookie is dropped on
+ * fetches — the app then looks logged-out everywhere (no logout, empty review). A real
+ * (non-local) NEXT_PUBLIC_API_BASE is left untouched for production deployments.
+ */
+function resolveApiBase(): string {
+  if (typeof window === "undefined") return CONFIGURED_API_BASE;
+  try {
+    const configured = new URL(CONFIGURED_API_BASE);
+    const configuredIsLocal = configured.hostname === "localhost" || configured.hostname === "127.0.0.1";
+    const browsingIsLocal =
+      window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1";
+    if (configuredIsLocal && browsingIsLocal) {
+      return `${window.location.protocol}//${window.location.hostname}:${configured.port || "8000"}`;
+    }
+  } catch {
+    // Fall through to the configured base on any parse error.
+  }
+  return CONFIGURED_API_BASE;
+}
+
+export const API_BASE = resolveApiBase();
 
 /** Shared severity union for proctoring/flag tones. Single source of truth. */
 export type Severity = "info" | "warning" | "high";
@@ -187,9 +212,19 @@ export async function getMe() {
 /** Alias for getMe(); mirrors the backend `me` endpoint name. */
 export const me = getMe;
 
+/** Upload the full-viva webcam recording (review-only) for the current student attempt. */
+export async function uploadRecording(blob: Blob) {
+  const form = new FormData();
+  form.append("recording", blob, "viva.webm");
+  return api<{ recording_id: string; size_bytes: number }>(
+    "/api/student/attempts/current/recording",
+    { method: "POST", body: form }
+  );
+}
+
 /** Log out the current session (clears auth + csrf cookies server-side). */
 export async function logout() {
-  return api<{ ok: boolean }>("/api/auth/logout", { method: "POST" });
+  return api<{ ok: boolean; role: "staff" | "student" | null }>("/api/auth/logout", { method: "POST" });
 }
 
 /** Invite an additional staff member (super_admin only). */

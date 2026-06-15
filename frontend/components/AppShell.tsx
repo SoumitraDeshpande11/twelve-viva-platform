@@ -13,6 +13,7 @@ import {
 import { cn } from "../lib/cn";
 import { getMe, logout, type Me, type StaffRole } from "../lib/api";
 import { ThemeToggle } from "./ui/ThemeToggle";
+import { Button } from "./ui/Button";
 
 /**
  * Nav links gated by staff role. `roles: null` = always visible (e.g. the
@@ -38,6 +39,21 @@ const NAV: {
   },
 ];
 
+const ROLE_LABELS: Record<StaffRole, string> = {
+  super_admin: "Super admin",
+  exam_admin: "Exam admin",
+  examiner: "Examiner",
+  invigilator: "Invigilator",
+};
+const ROLE_ORDER: StaffRole[] = ["super_admin", "exam_admin", "examiner", "invigilator"];
+
+/** Compact role badge: highest-privilege role + "+N" when the user holds several. */
+function primaryRoleLabel(roles: StaffRole[]): string {
+  const top = ROLE_ORDER.find((role) => roles.includes(role));
+  if (!top) return "Staff";
+  return roles.length > 1 ? `${ROLE_LABELS[top]} +${roles.length - 1}` : ROLE_LABELS[top];
+}
+
 function navIsVisible(item: (typeof NAV)[number], me: Me | null): boolean {
   // Student-only links are hidden from logged-in staff (conflict of interest).
   if (item.studentOnly) return me?.role !== "staff";
@@ -53,6 +69,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const [me, setMe] = useState<Me | null>(null);
   const [loggingOut, setLoggingOut] = useState(false);
+  // Student "End session" is consequential mid-viva, so it routes through a confirm step.
+  const [confirmEnd, setConfirmEnd] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -69,16 +87,19 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   }, [pathname]);
 
   const staff = me?.role === "staff" ? me : null;
+  const student = me?.role === "student" ? me : null;
   const displayName = staff?.user.name || staff?.user.email || null;
 
-  async function handleLogout() {
+  // `target` is where to land after the session is cleared: staff back to home,
+  // student (and the staff "test as a student" path) to the /student entry form.
+  async function handleLogout(target = "/") {
     setLoggingOut(true);
     try {
       await logout();
     } catch {
       // Ignore — still redirect so the user is not stuck on a stale session.
     } finally {
-      window.location.assign("/");
+      window.location.assign(target);
     }
   }
 
@@ -125,19 +146,84 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                   <span className="text-[0.78rem] font-medium tracking-tight text-ink">
                     {displayName}
                   </span>
-                  <span className="text-[0.6rem] uppercase tracking-[0.18em] text-muted">
-                    {staff.roles.join(" · ").replace(/_/g, " ") || "staff"}
+                  <span
+                    className="text-[0.6rem] uppercase tracking-[0.18em] text-muted"
+                    title={staff.roles.join(", ").replace(/_/g, " ")}
+                  >
+                    {primaryRoleLabel(staff.roles)}
                   </span>
                 </span>
+                {/* Staff cannot sit a viva while signed in (backend rejects it, and the
+                    Viva nav is hidden). Signpost the path: log out → /student entry. */}
                 <button
                   type="button"
-                  onClick={handleLogout}
+                  onClick={() => handleLogout("/student")}
+                  disabled={loggingOut}
+                  title="Log out and open the student entry form to test the viva"
+                  className="hidden h-9 items-center gap-1.5 rounded-full border border-line-strong bg-surface px-3 text-[0.78rem] font-medium text-ink-soft transition-colors hover:border-accent/40 hover:text-accent disabled:opacity-45 sm:inline-flex"
+                >
+                  <GraduationCap size={15} /> Test as student
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleLogout("/")}
                   disabled={loggingOut}
                   aria-label="Log out"
                   className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-line-strong bg-surface text-ink-soft transition-colors hover:border-accent/40 hover:text-accent disabled:opacity-45"
                 >
                   <SignOut size={16} />
                 </button>
+              </div>
+            )}
+            {student && (
+              <div className="relative mr-1 flex items-center gap-1.5">
+                <span className="hidden items-center gap-1.5 rounded-full border border-accent/30 bg-accent-soft px-2.5 py-1 text-[0.72rem] font-medium tracking-tight text-accent sm:inline-flex">
+                  <span className="h-1.5 w-1.5 rounded-full bg-accent" aria-hidden />
+                  Student attempt
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setConfirmEnd(true)}
+                  disabled={loggingOut}
+                  className="inline-flex h-9 items-center gap-1.5 rounded-full border border-danger/40 bg-surface px-3 text-[0.78rem] font-medium text-danger transition-colors hover:bg-danger-soft disabled:opacity-45"
+                >
+                  <SignOut size={15} /> End session
+                </button>
+                {confirmEnd && (
+                  <>
+                    {/* Click-away backdrop. */}
+                    <div
+                      className="fixed inset-0 z-40"
+                      aria-hidden
+                      onClick={() => setConfirmEnd(false)}
+                    />
+                    <div
+                      role="dialog"
+                      aria-modal="true"
+                      aria-label="End your viva session"
+                      className="absolute right-0 top-12 z-50 w-72 rounded-[var(--radius-control)] border border-line-strong bg-paper p-4 shadow-[var(--shadow-card)]"
+                    >
+                      <p className="text-[0.85rem] font-medium text-ink">End your viva session?</p>
+                      <p className="mt-1.5 text-[0.78rem] leading-snug text-muted">
+                        Your progress is saved. You&apos;ll need a valid one-time code to resume — if
+                        yours is already used, ask an invigilator to reset your attempt.
+                      </p>
+                      <div className="mt-3 flex justify-end gap-2">
+                        <Button size="sm" variant="ghost" onClick={() => setConfirmEnd(false)}>
+                          Cancel
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="danger"
+                          disabled={loggingOut}
+                          onClick={() => handleLogout("/student")}
+                        >
+                          End session
+                        </Button>
+                      </div>
+                    </div>
+                  </>
+                )}
               </div>
             )}
             <ThemeToggle />
