@@ -110,6 +110,9 @@ export type VivaSession = {
   score_source?: "ai" | "professor_override" | string;
   override_reviewer?: string | null;
   override_reason?: string | null;
+  mark_mode?: "professor_approved" | "ai_official" | string;
+  score_official?: boolean;
+  score_status?: "official" | "provisional" | string;
   started_at: string;
   ended_at?: string;
   questions: VivaQuestion[];

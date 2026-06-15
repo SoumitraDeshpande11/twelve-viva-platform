@@ -128,6 +128,9 @@ export default function ReviewPage() {
                   ) : (
                     <p className="muted small">AI score</p>
                   )}
+                  <span className={selected.score_official ? "status ok" : "status warn"}>
+                    {selected.score_status ?? "provisional"}{selected.mark_mode === "ai_official" ? " · AI official" : ""}
+                  </span>
                 </div>
               </div>
               <div className="row">

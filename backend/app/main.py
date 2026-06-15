@@ -407,10 +407,10 @@ def start_session(payload: StartSessionRequest, response: Response) -> dict[str,
         now = utc_now()
         conn.execute(
             """
-            INSERT INTO viva_sessions (id, exam_id, student_id, status, permissions_json, plan_json, current_index, started_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO viva_sessions (id, exam_id, student_id, status, permissions_json, plan_json, current_index, started_at, consent_accepted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (session_id, payload.exam_id, student["id"], "active", as_json(payload.permissions.model_dump()), as_json([q.__dict__ for q in plan]), 0, now),
+            (session_id, payload.exam_id, student["id"], "active", as_json(payload.permissions.model_dump()), as_json([q.__dict__ for q in plan]), 0, now, now),
         )
         for ordinal, seed in enumerate(plan, start=1):
             conn.execute(
@@ -1105,7 +1105,7 @@ def list_review_sessions(request: Request) -> list[dict[str, Any]]:
         sessions = rows_to_dicts(
             conn.execute(
                 """
-                SELECT vs.*, e.name AS exam_name, s.name AS student_name, s.roll_number
+                SELECT vs.*, e.name AS exam_name, e.mark_mode, s.name AS student_name, s.roll_number
                 FROM viva_sessions vs
                 JOIN exams e ON e.id = vs.exam_id
                 JOIN students s ON s.id = vs.student_id
@@ -1113,11 +1113,7 @@ def list_review_sessions(request: Request) -> list[dict[str, Any]]:
                 """
             )
         )
-        for session in sessions:
-            session["proctoring_count"] = conn.execute("SELECT COUNT(*) FROM proctoring_events WHERE session_id = ?", (session["id"],)).fetchone()[0]
-            override = latest_override(conn, session["id"])
-            apply_effective_score(session, [override] if override else [])
-        return sessions
+        return attach_session_list_metadata(conn, sessions)
 
 
 @app.get("/api/review/sessions/{session_id}")
@@ -1134,7 +1130,7 @@ def list_review_exam_sessions(exam_id: str, request: Request) -> list[dict[str, 
         sessions = rows_to_dicts(
             conn.execute(
                 """
-                SELECT vs.*, e.name AS exam_name, s.name AS student_name, s.roll_number
+                SELECT vs.*, e.name AS exam_name, e.mark_mode, s.name AS student_name, s.roll_number
                 FROM viva_sessions vs
                 JOIN exams e ON e.id = vs.exam_id
                 JOIN students s ON s.id = vs.student_id
@@ -1144,11 +1140,7 @@ def list_review_exam_sessions(exam_id: str, request: Request) -> list[dict[str, 
                 (exam_id,),
             )
         )
-        for session in sessions:
-            session["proctoring_count"] = conn.execute("SELECT COUNT(*) FROM proctoring_events WHERE session_id = ?", (session["id"],)).fetchone()[0]
-            override = latest_override(conn, session["id"])
-            apply_effective_score(session, [override] if override else [])
-        return sessions
+        return attach_session_list_metadata(conn, sessions)
 
 
 @app.post("/api/review/sessions/{session_id}/score-review")
@@ -1525,6 +1517,8 @@ def finalize_session(conn: Any, session_id: str) -> None:
         "UPDATE viva_sessions SET status = ?, final_score = ?, ended_at = COALESCE(ended_at, ?) WHERE id = ?",
         ("completed", final_score, utc_now(), session_id),
     )
+    # active_session_id points at the student's in-progress attempt; clear it once finalized.
+    conn.execute("UPDATE students SET active_session_id = NULL WHERE active_session_id = ?", (session_id,))
     log_transcript(conn, session_id, "session_finalized", {"final_score": final_score})
 
 
@@ -1532,7 +1526,7 @@ def hydrate_session(conn: Any, session_id: str, include_private: bool = False) -
     session = row_to_dict(
         conn.execute(
             """
-            SELECT vs.*, e.name AS exam_name, e.rubric, s.name AS student_name, s.roll_number
+            SELECT vs.*, e.name AS exam_name, e.rubric, e.mark_mode, s.name AS student_name, s.roll_number
             FROM viva_sessions vs
             JOIN exams e ON e.id = vs.exam_id
             JOIN students s ON s.id = vs.student_id
@@ -1593,7 +1587,9 @@ def hydrate_session(conn: Any, session_id: str, include_private: bool = False) -
     session["transcript_events"] = transcript
     session["audio_submissions"] = audio_submissions
     session["rubric"] = session["rubric"] if include_private else None
-    reviews = rows_to_dicts(conn.execute("SELECT * FROM score_reviews WHERE session_id = ? ORDER BY created_at", (session_id,)))
+    # Deterministic tie-break (created_at, rowid) so reviews[-1] is the same newest
+    # override that latest_override resolves to for the list endpoints.
+    reviews = rows_to_dicts(conn.execute("SELECT * FROM score_reviews WHERE session_id = ? ORDER BY created_at, rowid", (session_id,)))
     # Students see their effective (possibly overridden) grade, but never the reviewer
     # identity or the private override reason — those stay staff-only.
     session["score_reviews"] = reviews if include_private else []
@@ -1608,6 +1604,34 @@ def latest_override(conn: Any, session_id: str) -> dict[str, Any] | None:
             (session_id,),
         ).fetchone()
     )
+
+
+def attach_session_list_metadata(conn: Any, sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Attach proctoring_count + effective-score fields to a session list in 2 queries (no N+1)."""
+    if not sessions:
+        return sessions
+    ids = [session["id"] for session in sessions]
+    placeholders = ",".join("?" for _ in ids)
+    counts = {
+        row["session_id"]: row["n"]
+        for row in rows_to_dicts(
+            conn.execute(
+                f"SELECT session_id, COUNT(*) AS n FROM proctoring_events WHERE session_id IN ({placeholders}) GROUP BY session_id",
+                ids,
+            )
+        )
+    }
+    # Ordered ascending with rowid tie-break, so the last row seen per session is the newest override.
+    latest_by_session: dict[str, dict[str, Any]] = {}
+    for review in rows_to_dicts(
+        conn.execute(f"SELECT * FROM score_reviews WHERE session_id IN ({placeholders}) ORDER BY created_at, rowid", ids)
+    ):
+        latest_by_session[review["session_id"]] = review
+    for session in sessions:
+        session["proctoring_count"] = counts.get(session["id"], 0)
+        override = latest_by_session.get(session["id"])
+        apply_effective_score(session, [override] if override else [])
+    return sessions
 
 
 def apply_effective_score(session: dict[str, Any], reviews: list[dict[str, Any]] | None, include_private: bool = True) -> None:
@@ -1629,3 +1653,25 @@ def apply_effective_score(session: dict[str, Any], reviews: list[dict[str, Any]]
         session["score_source"] = "ai"
         session["override_reviewer"] = None
         session["override_reason"] = None
+    apply_mark_mode_status(session)
+
+
+def apply_mark_mode_status(session: dict[str, Any]) -> None:
+    """Resolve whether the effective score is official, per the exam's mark_mode.
+
+    ai_official: the AI score is official as soon as the session completes (a professor
+        override still supersedes it). professor_approved: the score stays provisional
+        until a professor records an override/approval.
+    """
+    mark_mode = session.get("mark_mode") or "professor_approved"
+    completed = session.get("status") == "completed"
+    overridden = bool(session.get("score_overridden"))
+    if not completed:
+        official = False
+    elif mark_mode == "ai_official":
+        official = True
+    else:  # professor_approved
+        official = overridden
+    session["mark_mode"] = mark_mode
+    session["score_official"] = official
+    session["score_status"] = "official" if official else "provisional"
