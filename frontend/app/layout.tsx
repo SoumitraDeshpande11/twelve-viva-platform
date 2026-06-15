@@ -1,35 +1,46 @@
 import type { Metadata } from "next";
-import Link from "next/link";
-import { GraduationCap, MonitorCheck, ShieldCheck } from "lucide-react";
+import { Fraunces, Hanken_Grotesk, JetBrains_Mono } from "next/font/google";
+import { Providers } from "./providers";
+import { AppShell } from "../components/AppShell";
 import "./globals.css";
 
+const fraunces = Fraunces({
+  subsets: ["latin"],
+  variable: "--font-fraunces",
+  axes: ["opsz"],
+  display: "swap",
+});
+
+const hanken = Hanken_Grotesk({
+  subsets: ["latin"],
+  variable: "--font-hanken",
+  weight: ["400", "500", "600"],
+  display: "swap",
+});
+
+const jetbrains = JetBrains_Mono({
+  subsets: ["latin"],
+  variable: "--font-jetbrains",
+  weight: ["400", "500"],
+  display: "swap",
+});
+
 export const metadata: Metadata = {
-  title: "TWELVE Pilot",
-  description: "Browser-based AI viva pilot platform"
+  title: "TWELVE — AI Viva Pilot",
+  description: "Browser-based AI viva platform: exam setup, proctored oral exams, and professor review.",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="en">
+    <html
+      lang="en"
+      suppressHydrationWarning
+      className={`${fraunces.variable} ${hanken.variable} ${jetbrains.variable}`}
+    >
       <body>
-        <header className="topbar">
-          <Link href="/" className="brand" aria-label="TWELVE home">
-            <GraduationCap size={24} />
-            <span>TWELVE</span>
-          </Link>
-          <nav aria-label="Primary">
-            <Link href="/admin">
-              <MonitorCheck size={18} />
-              Admin
-            </Link>
-            <Link href="/student">
-              <ShieldCheck size={18} />
-              Student Viva
-            </Link>
-            <Link href="/review">Review</Link>
-          </nav>
-        </header>
-        {children}
+        <Providers>
+          <AppShell>{children}</AppShell>
+        </Providers>
       </body>
     </html>
   );

@@ -1,5 +1,26 @@
 export const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000";
 
+/** Shared severity union for proctoring/flag tones. Single source of truth. */
+export type Severity = "info" | "warning" | "high";
+
+/** Staff role identifiers (mirror backend require_staff role sets). */
+export type StaffRole = "super_admin" | "exam_admin" | "examiner" | "invigilator";
+
+/** Response shape of GET /api/auth/me. */
+export type Me =
+  | {
+      role: "staff";
+      user: { id: string; email: string; name: string };
+      roles: StaffRole[];
+      csrf_token?: string;
+    }
+  | {
+      role: "student";
+      csrf_token?: string;
+      session_id?: string;
+      student_id?: string;
+    };
+
 export type Exam = {
   id: string;
   name: string;
@@ -68,7 +89,7 @@ export type ProctoringEvent = {
   details: Record<string, unknown>;
   confidence: number;
   duration_ms?: number;
-  severity?: "info" | "warning" | "high";
+  severity?: Severity;
   created_at: string;
 };
 
@@ -156,6 +177,32 @@ export function getCsrfToken() {
     return "";
   }
   return window.localStorage.getItem("twelve_csrf") ?? "";
+}
+
+/** Fetch the current authenticated identity (staff or student) and roles. */
+export async function getMe() {
+  return api<Me>("/api/auth/me");
+}
+
+/** Alias for getMe(); mirrors the backend `me` endpoint name. */
+export const me = getMe;
+
+/** Log out the current session (clears auth + csrf cookies server-side). */
+export async function logout() {
+  return api<{ ok: boolean }>("/api/auth/logout", { method: "POST" });
+}
+
+/** Invite an additional staff member (super_admin only). */
+export async function createStaff(input: {
+  email: string;
+  name: string;
+  password: string;
+  roles: StaffRole[];
+}) {
+  return api<{ id: string; email: string; name: string; roles: StaffRole[] }>("/api/auth/staff", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
 }
 
 export function makeIdempotencyKey() {

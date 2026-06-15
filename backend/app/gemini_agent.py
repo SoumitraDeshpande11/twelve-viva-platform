@@ -154,11 +154,21 @@ def create_followup_with_gemini(question: dict[str, Any], answer_text: str, rubr
     return followup if payload["should_ask"] and followup else None
 
 
+def sanitize_schema(node: Any) -> Any:
+    """Strip JSON-Schema keywords the Gemini responseSchema field rejects (e.g. additionalProperties)."""
+    if isinstance(node, dict):
+        return {k: sanitize_schema(v) for k, v in node.items() if k != "additionalProperties"}
+    if isinstance(node, list):
+        return [sanitize_schema(v) for v in node]
+    return node
+
+
 def call_structured_response(schema: dict[str, Any], instructions: str, user_input: dict[str, Any]) -> dict[str, Any]:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise GeminiAgentError("GEMINI_API_KEY is not configured")
 
+    schema = sanitize_schema(schema)
     model = os.getenv("GEMINI_VIVA_MODEL", DEFAULT_MODEL)
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     request = {
@@ -176,12 +186,8 @@ def call_structured_response(schema: dict[str, Any], instructions: str, user_inp
             }
         ],
         "generationConfig": {
-            "responseFormat": {
-                "text": {
-                    "mimeType": "application/json",
-                    "schema": schema,
-                }
-            }
+            "responseMimeType": "application/json",
+            "responseSchema": schema,
         },
     }
 

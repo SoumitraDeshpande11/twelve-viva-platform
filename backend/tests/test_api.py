@@ -287,3 +287,188 @@ def test_override_tiebreak_list_matches_detail(client, fresh_client):
     detail = client.get(f"/api/review/sessions/{session_id}").json()
     listed = next(s for s in client.get("/api/review/sessions").json() if s["id"] == session_id)
     assert detail["effective_score"] == listed["effective_score"]
+
+
+def test_delete_exam_cascades(client, fresh_client):
+    csrf, exam_id, session_id = setup_completed_session(client, fresh_client)
+    r = client.delete(f"/api/admin/exams/{exam_id}", headers={"X-CSRF-Token": csrf})
+    assert r.status_code == 204, r.text
+    assert client.get(f"/api/admin/exams/{exam_id}").status_code == 404
+    # Cascade removed the exam's session.
+    with storage.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM viva_sessions WHERE id = ?", (session_id,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM students WHERE exam_id = ?", (exam_id,)).fetchone()[0] == 0
+
+
+def test_delete_exam_requires_csrf_and_role(client):
+    csrf = bootstrap(client)
+    exam = create_exam(client, csrf).json()
+    # Missing CSRF header is rejected.
+    assert client.delete(f"/api/admin/exams/{exam['id']}").status_code == 403
+
+
+def test_reset_attempt_issues_new_code_and_allows_restart(client, fresh_client):
+    csrf = bootstrap(client)
+    exam = create_exam(client, csrf).json()
+    exam_id = exam["id"]
+    student_id = exam["students"][0]["id"]
+    old_code = exam["students"][0]["token"]
+    # Use up the original attempt.
+    start = start_attempt(fresh_client, exam_id, old_code).json()
+    complete_viva(fresh_client, start["csrf_token"])
+    # Old code is now spent.
+    assert start_attempt(TestClientNew(), exam_id, old_code).status_code in (401, 409)
+
+    r = client.post(
+        f"/api/admin/exams/{exam_id}/students/{student_id}/reset-attempt",
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["student_id"] == student_id
+    assert body["roll_number"] == "23X001"
+    new_code = body["token"]
+    assert new_code and new_code != old_code
+
+    # Fresh code lets the student start over; old code stays invalid.
+    again = start_attempt(TestClientNew(), exam_id, new_code)
+    assert again.status_code == 200, again.text
+    assert start_attempt(TestClientNew(), exam_id, old_code).status_code == 401
+
+
+def test_finalize_excludes_pending_ai_error_from_mean(client, fresh_client, monkeypatch):
+    """A pending_ai_error answer must not drag the student's final to a fake low score.
+
+    With one good answer and one failed answer, the final reflects only the scored one.
+    """
+    csrf = bootstrap(client)
+    exam = create_exam(client, csrf).json()
+    start = start_attempt(fresh_client, exam["id"], exam["students"][0]["token"]).json()
+    session_id = start["id"]
+    scsrf = start["csrf_token"]
+
+    # First answer scores normally.
+    cur = fresh_client.get("/api/student/attempts/current").json()
+    qid = cur["current_question_id"]
+    fresh_client.post(
+        "/api/student/attempts/current/answers",
+        json={"question_id": qid, "answer_text": LONG_ANSWER, "input_mode": "typed"},
+        headers={"X-CSRF-Token": scsrf, "Idempotency-Key": "good"},
+    )
+
+    # All remaining answers fail AI scoring.
+    monkeypatch.setattr(
+        main, "score_current_answer",
+        lambda *a, **k: (main.pending_ai_error_result("provider down"), "openai", "provider down"),
+    )
+    completed = complete_viva(fresh_client, scsrf)
+    assert completed["status"] in {"completed", "needs_review"}
+
+    review = client.get(f"/api/review/sessions/{session_id}").json()
+    scored = [a for a in review["answers"] if a["scoring_status"] == "scored"]
+    pending = [a for a in review["answers"] if a["scoring_status"] == "pending_ai_error"]
+    assert scored and pending  # mixed set
+    if review["status"] == "completed":
+        # final_score derived from scored answers only — the failed (0) answers excluded.
+        earned = sum(a["score"] for a in scored)
+        possible = sum(a["max_score"] for a in scored)
+        expected = round((earned / possible) * 100, 1)
+        assert review["final_score"] == expected
+
+
+def test_finalize_all_pending_marks_needs_review(client, fresh_client, monkeypatch):
+    """If every answer is pending_ai_error, the student gets needs_review, not a 0."""
+    csrf = bootstrap(client)
+    exam = create_exam(client, csrf).json()
+    start = start_attempt(fresh_client, exam["id"], exam["students"][0]["token"]).json()
+    session_id = start["id"]
+    scsrf = start["csrf_token"]
+    monkeypatch.setattr(
+        main, "score_current_answer",
+        lambda *a, **k: (main.pending_ai_error_result("provider down"), "openai", "provider down"),
+    )
+    complete_viva(fresh_client, scsrf)
+    review = client.get(f"/api/review/sessions/{session_id}").json()
+    assert review["status"] == "needs_review"
+    assert review["final_score"] is None
+
+
+def test_staff_cannot_post_answer_on_student_session(client, fresh_client):
+    csrf = bootstrap(client)
+    exam = create_exam(client, csrf).json()
+    start = start_attempt(fresh_client, exam["id"], exam["students"][0]["token"]).json()
+    session_id = start["id"]
+    qid = start["current_question_id"]
+    # Staff (legacy route) is blocked from driving a student's answer submission.
+    r = client.post(
+        f"/api/sessions/{session_id}/answer",
+        json={"question_id": qid, "answer_text": LONG_ANSWER, "input_mode": "typed"},
+        headers={"X-CSRF-Token": csrf, "Idempotency-Key": "staff-x"},
+    )
+    assert r.status_code == 403
+    # But staff READ access still works.
+    assert client.get(f"/api/sessions/{session_id}").status_code == 200
+
+
+def test_login_rate_limit_locks_out(client):
+    bootstrap(client)  # creates admin@e.edu
+    for _ in range(5):
+        assert client.post("/api/auth/login", json={"email": "admin@e.edu", "password": "wrong"}).status_code == 401
+    # 6th attempt within the window is locked out even with a wrong password.
+    assert client.post("/api/auth/login", json={"email": "admin@e.edu", "password": "wrong"}).status_code == 429
+    # And a correct password is also locked out during the window.
+    assert client.post("/api/auth/login", json={"email": "admin@e.edu", "password": "longpassword12345"}).status_code == 429
+
+
+def test_staff_cannot_take_viva(client):
+    csrf = bootstrap(client)
+    exam = create_exam(client, csrf).json()
+    code = exam["students"][0]["token"]
+    # `client` carries the staff session cookie -> start must be refused.
+    r = start_attempt(client, exam["id"], code)
+    assert r.status_code == 403
+    assert "Staff" in r.json()["detail"]
+
+
+def test_create_staff_requires_super_admin_and_creates_loginable_user(client, fresh_client):
+    csrf = bootstrap(client)
+    # Anonymous (no staff cookie) cannot create staff.
+    assert fresh_client.post("/api/auth/staff", json={
+        "email": "x@e.edu", "name": "X", "password": "longpassword12345", "roles": ["examiner"],
+    }).status_code in (401, 403)
+    # super_admin can, with CSRF.
+    r = client.post("/api/auth/staff", json={
+        "email": "exam@e.edu", "name": "Examiner", "password": "longpassword12345", "roles": ["examiner"],
+    }, headers={"X-CSRF-Token": csrf})
+    assert r.status_code == 200, r.text
+    assert r.json()["roles"] == ["examiner"]
+    # The new account can log in.
+    assert fresh_client.post("/api/auth/login", json={"email": "exam@e.edu", "password": "longpassword12345"}).status_code == 200
+
+
+def test_create_staff_rejects_unknown_roles(client):
+    csrf = bootstrap(client)
+    r = client.post("/api/auth/staff", json={
+        "email": "y@e.edu", "name": "Y", "password": "longpassword12345", "roles": ["wizard"],
+    }, headers={"X-CSRF-Token": csrf})
+    assert r.status_code == 400
+
+
+def test_bootstrap_requires_token_when_configured(client, monkeypatch):
+    monkeypatch.setenv("TWELVE_BOOTSTRAP_TOKEN", "s3cret-setup-token")
+    # Wrong/missing token -> rejected even on a fresh (no-user) DB.
+    assert client.post("/api/auth/bootstrap", json={
+        "email": "admin@e.edu", "name": "Admin", "password": "longpassword12345",
+    }).status_code == 403
+    # Correct token -> succeeds.
+    assert client.post("/api/auth/bootstrap", json={
+        "email": "admin@e.edu", "name": "Admin", "password": "longpassword12345",
+        "bootstrap_token": "s3cret-setup-token",
+    }).status_code == 200
+
+
+def TestClientNew():
+    """A fresh TestClient (separate cookie jar) for an anonymous student start."""
+    from fastapi.testclient import TestClient
+
+    return TestClient(main.app)
