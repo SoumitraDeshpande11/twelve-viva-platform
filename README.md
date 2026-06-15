@@ -99,6 +99,8 @@ docker compose --profile prod-infra up -d
 
 ## Quick start (manual)
 
+**First time:** `./setup.sh` walks you through it — generates `TWELVE_SECRET_KEY`, picks an AI provider and stores any API keys, installs backend + frontend deps, and optionally pulls an Ollama model. Use `./setup.sh --yes` for non-interactive defaults (local provider). Then:
+
 One command bootstraps the venv + node deps and runs both servers:
 
 ```bash
