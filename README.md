@@ -56,10 +56,11 @@ TWELVE runs an end-to-end viva (oral exam) in the browser. An administrator sets
 | --- | --- |
 | **Exam setup** | CSV roster, rubric, problem statement, curriculum, and PDF/DOCX/ZIP/TXT submissions indexed as viva context. |
 | **One-time access** | Per-student exam codes (shown once at creation), roll-number verification, optional **time windows** (`opens at` / `closes at`). |
-| **AI questioning** | Five-question plan generated per student; one follow-up decided per base question. OpenAI, Gemini, or a deterministic local fallback. |
-| **Answers** | Spoken (server-side transcription) or typed, with idempotent submission and per-question scoring against the rubric. |
-| **Proctoring** | Logs tab switch, blur, fullscreen exit, camera/mic loss, screen-share stop, no/multiple faces, off-center gaze. Audit-only — never affects the score. |
-| **Professor review** | Transcripts, answer scores + reasoning, proctoring timeline, secure audio playback, and score overrides. |
+| **AI questioning** | Five-question plan generated per student; one follow-up decided per base question. OpenAI, Gemini, a local **Ollama** model (e.g. `llama3.2:3b`), or a deterministic local fallback. |
+| **Answers** | Spoken (server-side transcription — OpenAI, Gemini, or local **faster-whisper**) or typed, with idempotent submission and per-question scoring against the rubric. |
+| **Proctoring** | Logs tab switch, blur, fullscreen exit, camera/mic loss, screen-share stop, no/multiple faces. Live **fullscreen / leave-window gates** and a lightweight **lighting check** prompt the student. Audit-only — never affects the score. |
+| **Viva recording** | The whole viva is recorded (camera video + audio) and replayed by the examiner in a **Recording** tab. Review-only — never scored. |
+| **Professor review** | Transcripts, answer scores + reasoning, proctoring timeline, secure audio + video playback, and score overrides. |
 | **Score authority** | `mark_mode` drives an `official` / `provisional` status: AI-official on completion, or provisional until a professor approves. Overrides surface an `effective_score` without mutating the AI audit value. |
 | **Recovery** | Staff can re-score answers stuck on an AI error and re-transcribe failed audio (which re-syncs the answer and re-scores it). |
 
@@ -98,12 +99,19 @@ docker compose --profile prod-infra up -d
 
 ## Quick start (manual)
 
-For local development without Docker, in two terminals:
+One command bootstraps the venv + node deps and runs both servers:
+
+```bash
+./start.sh            # API (127.0.0.1:8000) + web (:3000); Ctrl-C stops both
+./start.sh --fresh    # force-reinstall deps first
+./start.sh --seed     # also seed a ready-to-take demo viva
+```
+
+`start.sh` works without `npm` for running (it launches Next directly), copies `.env` from `.env.example` if missing, and reuses the backend venv. Or run the two servers by hand:
 
 ```bash
 # API
-python3 -m venv backend/.venv
-source backend/.venv/bin/activate
+python3 -m venv backend/.venv && source backend/.venv/bin/activate
 pip install -r backend/requirements.txt
 cp .env.example .env
 cd backend && uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
@@ -111,11 +119,14 @@ cd backend && uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 ```bash
 # Web
-npm install --prefix frontend
-cd frontend && npm run dev
+npm install --prefix frontend && cd frontend && npm run dev
 ```
 
 Open **Admin** at `/admin`, **Student Viva** at `/student`, **Professor Review** at `/review`.
+
+### Demo viva
+
+`python backend/seed_demo.py` inserts a ready-to-take demo exam (based on this project) and prints the login: exam **Demo Viva — TWELVE Platform**, roll **DEMO01**, one-time code **VIVA-DEMO-2026**. Re-run to reset it. It loads the repo-root `.env` so the code hash matches the running server.
 
 The first staff account is created from the Admin or Review login screen via **First setup**, or by setting `TWELVE_BOOTSTRAP_ADMIN_EMAIL` / `TWELVE_BOOTSTRAP_ADMIN_PASSWORD` before first launch. Once any staff user exists, the bootstrap endpoint is disabled.
 
@@ -127,7 +138,7 @@ Set a long, random `TWELVE_SECRET_KEY` — it HMACs opaque session and student-i
 
 ### AI providers
 
-`TWELVE_AI_PROVIDER` is `auto` | `openai` | `gemini` | `local`. In `auto`, OpenAI is used if `OPENAI_API_KEY` is set, otherwise Gemini if `GEMINI_API_KEY` is set, otherwise the local fallback. The provider used is recorded in transcript events and scoring runs. In `local` / `development` / `test`, a provider scoring failure falls back to the deterministic local scorer; in staging/production it records `pending_ai_error` for professor review or retry instead of inventing a grade.
+`TWELVE_AI_PROVIDER` is `auto` | `openai` | `gemini` | `ollama` | `local`. In `auto`, OpenAI is used if `OPENAI_API_KEY` is set, otherwise Gemini if `GEMINI_API_KEY` is set, otherwise the local fallback. The provider used is recorded in transcript events and scoring runs. In `local` / `development` / `test`, a provider failure (incl. Ollama unreachable) falls back to the deterministic local scorer; in staging/production a scoring failure records `pending_ai_error` for professor review or retry instead of inventing a grade.
 
 ```bash
 TWELVE_AI_PROVIDER=auto
@@ -137,9 +148,20 @@ GEMINI_TTS_MODEL=gemini-3.1-flash-tts-preview
 GEMINI_TTS_VOICE=Kore
 ```
 
+**Local LLM (Ollama).** Set `TWELVE_AI_PROVIDER=ollama` to run scoring / questions / follow-ups against a local model via [Ollama](https://ollama.com) — cross-platform (Linux + macOS/Metal) and fully offline once the model is pulled. It uses Ollama's OpenAI-compatible endpoint and falls back to the heuristic local scorer on any error.
+
+```bash
+TWELVE_AI_PROVIDER=ollama
+OLLAMA_HOST=http://127.0.0.1:11434
+OLLAMA_MODEL=llama3.2:3b      # fits ~8 GB (M2) and a 6 GB GPU; pull with: ollama pull llama3.2:3b
+OLLAMA_MAX_TOKENS=1024
+```
+
+A GPU is strongly recommended (CUDA on Linux, Metal on Apple Silicon): warm scoring is ~1–2 s on GPU vs ~2 min on CPU. Keep `ollama serve` running; `OLLAMA_KEEP_ALIVE=30m` keeps the model warm between answers.
+
 ### Voice
 
-Spoken questions use Gemini TTS when configured, falling back to the browser's `speechSynthesis`. Student answers are transcribed server-side (`TWELVE_TRANSCRIPTION_PROVIDER=auto` prefers OpenAI, then Gemini, then local). Browser `SpeechRecognition` is a draft preview only; scoring always uses the server-stored transcript for uploaded audio. A real-time Gemini Live token endpoint (`POST /api/gemini/live-token`) is prepared but kept separate from the deterministic exam flow.
+Spoken questions use Gemini TTS when configured, falling back to the browser's `speechSynthesis`; the student can **play / pause / replay** the question audio. Student answers are transcribed server-side (`TWELVE_TRANSCRIPTION_PROVIDER=auto` prefers OpenAI, then Gemini, then local). Set `TWELVE_TRANSCRIPTION_PROVIDER=whisper` for fully-local STT via [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper) (`WHISPER_MODEL=base`, `WHISPER_DEVICE=cpu|cuda`). On any provider error in local/dev the server degrades to the browser draft rather than failing the answer. Browser `SpeechRecognition` is a draft preview only; scoring always uses the server-stored transcript for uploaded audio. A real-time Gemini Live token endpoint is prepared but kept separate from the deterministic exam flow.
 
 See [`.env.example`](.env.example) for the full set of variables.
 
@@ -165,7 +187,7 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-The suite (15 tests) covers the full viva flow, idempotent submission, exam time windows and mixed-offset validation, `mark_mode` official/provisional behaviour, score-override effective score and student privacy, override tie-break consistency, recovery from `pending_ai_error`, and audio re-transcription re-syncing and re-scoring the answer.
+The suite (46 tests) covers the full viva flow, idempotent submission, exam time windows and mixed-offset validation, `mark_mode` official/provisional behaviour, score-override effective score and student privacy, override tie-break consistency, recovery from `pending_ai_error`, audio re-transcription re-syncing and re-scoring, logout audit events, transcription provider fallback (503/429 → local draft), viva recording upload / staff-only path-jailed serving / exam-delete cleanup, and Ollama + faster-whisper provider dispatch.
 
 ---
 
@@ -189,7 +211,9 @@ The current implementation is a hardened SQLite pilot. The API contracts and con
 - [ ] Start a student session after granting camera, mic, and fullscreen.
 - [ ] Submit a typed answer; verify it appears with score and reasoning.
 - [ ] Record a voice answer in a supported browser; verify the server transcript submits.
-- [ ] Trigger proctoring flags (tab switch, fullscreen exit, screen-share stop, camera block) and confirm they appear.
+- [ ] Trigger proctoring flags (tab switch, fullscreen exit, screen-share stop, camera block) and confirm they appear, and that leaving fullscreen / the window shows the re-entry gate.
+- [ ] Finalize, then in review open the **Recording** tab and confirm the viva video plays back.
+- [ ] Log out as a student (header **End session**) and confirm the cookie clears and `/student` returns to the entry form.
 - [ ] Finalize and inspect answer scores, transcript events, and proctoring events in review.
 - [ ] Confirm the final score derives from answer scores only, not proctoring flags.
 - [ ] Override a score and confirm the student sees the effective grade but not the reviewer or reason.
