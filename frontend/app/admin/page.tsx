@@ -84,6 +84,16 @@ export default function AdminPage() {
               <option value="ai_official">AI official unless overridden</option>
             </select>
           </div>
+          <div className="grid two">
+            <div className="field">
+              <label htmlFor="starts_at">Opens at (optional)</label>
+              <input id="starts_at" name="starts_at" type="datetime-local" />
+            </div>
+            <div className="field">
+              <label htmlFor="ends_at">Closes at (optional)</label>
+              <input id="ends_at" name="ends_at" type="datetime-local" />
+            </div>
+          </div>
           <div className="field">
             <label htmlFor="student_csv">Student CSV</label>
             <input id="student_csv" name="student_csv" type="file" accept=".csv" required />
@@ -105,6 +115,11 @@ export default function AdminPage() {
               <button key={exam.id} className={selected?.id === exam.id ? "secondary" : ""} onClick={async () => setSelected(await api<Exam>(`/api/admin/exams/${exam.id}`))} type="button">
                 <span>{exam.name}</span>
                 <span className="muted small">{exam.student_count ?? 0} students · {exam.session_count ?? 0} sessions</span>
+                {(exam.starts_at || exam.ends_at) && (
+                  <span className="muted small">
+                    Window {exam.starts_at ? new Date(exam.starts_at).toLocaleString() : "any"} → {exam.ends_at ? new Date(exam.ends_at).toLocaleString() : "any"}
+                  </span>
+                )}
               </button>
             ))}
             {!exams.length && <p className="muted small">No exams yet.</p>}

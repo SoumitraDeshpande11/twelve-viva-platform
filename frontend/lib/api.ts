@@ -13,6 +13,8 @@ export type Exam = {
   submissions?: Submission[];
   status?: string;
   mark_mode?: "professor_approved" | "ai_official";
+  starts_at?: string | null;
+  ends_at?: string | null;
 };
 
 export type Student = {
@@ -103,6 +105,11 @@ export type VivaSession = {
   roll_number: string;
   status: "active" | "completed" | string;
   final_score: number | null;
+  effective_score?: number | null;
+  score_overridden?: boolean;
+  score_source?: "ai" | "professor_override" | string;
+  override_reviewer?: string | null;
+  override_reason?: string | null;
   started_at: string;
   ended_at?: string;
   questions: VivaQuestion[];

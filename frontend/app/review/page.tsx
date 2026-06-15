@@ -60,6 +60,21 @@ export default function ReviewPage() {
     setSelected(await api<ReviewSession>(`/api/review/sessions/${selected.id}`));
   }
 
+  async function rescoreAnswer(answerId: string) {
+    if (!selected) {
+      return;
+    }
+    setSelected(await api<ReviewSession>(`/api/review/sessions/${selected.id}/answers/${answerId}/rescore`, { method: "POST" }));
+  }
+
+  async function retranscribeAudio(audioId: string) {
+    if (!selected) {
+      return;
+    }
+    await api(`/api/review/sessions/${selected.id}/audio/${audioId}/retranscribe`, { method: "POST" });
+    setSelected(await api<ReviewSession>(`/api/review/sessions/${selected.id}`));
+  }
+
   if (needsAuth) {
     return <AuthPanel onReady={() => { setNeedsAuth(false); loadSessions().catch((error) => setMessage(error.message)); }} />;
   }
@@ -84,7 +99,7 @@ export default function ReviewPage() {
               <button key={session.id} className={selected?.id === session.id ? "secondary" : ""} onClick={() => selectSession(session.id)} type="button">
                 <strong>{session.student_name}</strong>
                 <span className="muted small">
-                  {session.roll_number} · {session.status} · {session.final_score ?? "pending"}%
+                  {session.roll_number} · {session.status} · {session.effective_score ?? session.final_score ?? "pending"}%{session.score_overridden ? " (override)" : ""}
                 </span>
                 <span className={session.proctoring_count ? "status warn" : "status ok"}>
                   <ShieldAlert size={15} /> {session.proctoring_count ?? 0} flags
@@ -104,7 +119,16 @@ export default function ReviewPage() {
                   <h2 className="section-title">{selected.student_name}</h2>
                   <p className="muted small">{selected.exam_name} · {selected.roll_number}</p>
                 </div>
-                <div className="score">{selected.final_score ?? 0}%</div>
+                <div style={{ textAlign: "right" }}>
+                  <div className="score">{selected.effective_score ?? selected.final_score ?? 0}%</div>
+                  {selected.score_overridden ? (
+                    <p className="muted small">
+                      Professor override{selected.override_reviewer ? ` · ${selected.override_reviewer}` : ""} · AI {selected.final_score ?? 0}%
+                    </p>
+                  ) : (
+                    <p className="muted small">AI score</p>
+                  )}
+                </div>
               </div>
               <div className="row">
                 <span className={selected.status === "completed" ? "status ok" : "status warn"}>
@@ -149,12 +173,22 @@ export default function ReviewPage() {
                           <p className="muted small">
                             Score {answer.score}/{answer.max_score} · {answer.scoring_status ?? "scored"} · {answer.scorer_provider ?? "unknown"}
                           </p>
+                          {answer.scoring_status === "pending_ai_error" && (
+                            <button type="button" onClick={() => rescoreAnswer(answer.id).catch((error) => setMessage(error.message))}>
+                              <RefreshCcw size={14} /> Retry AI scoring
+                            </button>
+                          )}
                           <p className="muted small">{answer.reasoning}</p>
                           {answer.audio_ref && <audio controls src={`${API_BASE}/api/review/audio?ref=${encodeURIComponent(answer.audio_ref)}`} />}
                           {answer.audio_ref && selected.audio_submissions?.filter((audio) => audio.audio_ref === answer.audio_ref).map((audio) => (
-                            <p className="muted small" key={audio.id}>
+                            <div className="muted small" key={audio.id}>
                               Transcript {audio.transcription_status} · {audio.transcription_provider}{audio.transcription_model ? ` · ${audio.transcription_model}` : ""}
-                            </p>
+                              {audio.transcription_status === "pending_transcription_error" && (
+                                <button type="button" style={{ marginLeft: 8 }} onClick={() => retranscribeAudio(audio.id).catch((error) => setMessage(error.message))}>
+                                  <RefreshCcw size={14} /> Retry transcription
+                                </button>
+                              )}
+                            </div>
                           ))}
                         </>
                       ) : (
