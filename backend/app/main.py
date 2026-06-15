@@ -190,8 +190,13 @@ def me(request: Request) -> dict[str, Any]:
     return {"role": "staff", "user": user, "roles": roles, "csrf_token": auth["csrf_token"]}
 
 
-def normalize_window_bound(value: str | None, field: str) -> str | None:
-    """Parse an optional exam-window timestamp (ISO or HTML datetime-local) to a tz-aware ISO string, or None."""
+def normalize_window_bound(value: str | None, field: str) -> datetime | None:
+    """Parse an optional exam-window timestamp (offset-aware ISO) to a tz-aware datetime, or None.
+
+    A naive value (no offset) is assumed UTC; clients should send an offset-aware
+    ISO string (e.g. new Date(localInput).toISOString()) so the admin's local time
+    is not silently reinterpreted as UTC.
+    """
     if not value or not value.strip():
         return None
     try:
@@ -200,7 +205,7 @@ def normalize_window_bound(value: str | None, field: str) -> str | None:
         raise HTTPException(status_code=400, detail=f"Invalid {field} timestamp.") from exc
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.isoformat()
+    return parsed
 
 
 @app.post("/api/admin/exams")
@@ -219,10 +224,12 @@ async def create_exam(
     require_staff(request, {"super_admin", "exam_admin"})
     if mark_mode not in {"professor_approved", "ai_official"}:
         raise HTTPException(status_code=400, detail="Unsupported mark mode.")
-    starts_at_value = normalize_window_bound(starts_at, "starts_at")
-    ends_at_value = normalize_window_bound(ends_at, "ends_at")
-    if starts_at_value and ends_at_value and ends_at_value <= starts_at_value:
+    starts_at_dt = normalize_window_bound(starts_at, "starts_at")
+    ends_at_dt = normalize_window_bound(ends_at, "ends_at")
+    if starts_at_dt and ends_at_dt and ends_at_dt <= starts_at_dt:
         raise HTTPException(status_code=400, detail="Exam end time must be after the start time.")
+    starts_at_value = starts_at_dt.isoformat() if starts_at_dt else None
+    ends_at_value = ends_at_dt.isoformat() if ends_at_dt else None
     exam_id = str(uuid.uuid4())
     now = utc_now()
     csv_bytes = await student_csv.read()
@@ -923,9 +930,66 @@ def create_score_review(session_id: str, payload: ReviewRequest, request: Reques
         return review
 
 
-@app.post("/api/review/sessions/{session_id}/answers/{answer_id}/rescore")
-def rescore_answer(session_id: str, answer_id: str, request: Request) -> dict[str, Any]:
-    require_staff(request, {"super_admin", "examiner"})
+def persist_scoring(conn: Any, answer_id: str, result: dict[str, Any], scorer_provider: str, scorer_error: str | None) -> tuple[str, str]:
+    """Write a scoring result onto an answer and append an immutable scoring_runs record."""
+    response_hash = hashlib.sha256(as_json(result).encode("utf-8")).hexdigest()
+    scoring_status = result.get("status", "scored")
+    conn.execute(
+        """
+        UPDATE answers
+        SET score = ?, max_score = ?, reasoning = ?, scoring_status = ?, scorer_provider = ?, scorer_error = ?,
+            rubric_breakdown_json = ?, expected_points_covered_json = ?, expected_points_missed_json = ?,
+            concerns_json = ?, response_hash = ?
+        WHERE id = ?
+        """,
+        (
+            result["score"],
+            result["max_score"],
+            result["reasoning"],
+            scoring_status,
+            scorer_provider,
+            scorer_error,
+            as_json(result.get("rubric_breakdown", {})),
+            as_json(result.get("expected_points_covered", [])),
+            as_json(result.get("expected_points_missed", [])),
+            as_json(result.get("concerns", [])),
+            response_hash,
+            answer_id,
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO scoring_runs (
+            id, answer_id, status, provider, model, score, max_score, rubric_breakdown_json,
+            expected_points_covered_json, expected_points_missed_json, concerns_json, reasoning,
+            prompt_version, response_hash, error, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(uuid.uuid4()),
+            answer_id,
+            scoring_status,
+            scorer_provider,
+            result.get("model"),
+            result["score"],
+            result["max_score"],
+            as_json(result.get("rubric_breakdown", {})),
+            as_json(result.get("expected_points_covered", [])),
+            as_json(result.get("expected_points_missed", [])),
+            as_json(result.get("concerns", [])),
+            result["reasoning"],
+            result.get("prompt_version", "v1"),
+            response_hash,
+            scorer_error,
+            utc_now(),
+        ),
+    )
+    return scoring_status, response_hash
+
+
+def recompute_answer_score(session_id: str, answer_id: str, request: Request) -> None:
+    """Re-run AI scoring for one answer against its CURRENT answer_text; re-finalize a completed session."""
     with connect() as conn:
         answer = row_to_dict(
             conn.execute("SELECT * FROM answers WHERE id = ? AND session_id = ?", (answer_id, session_id)).fetchone()
@@ -940,61 +1004,9 @@ def rescore_answer(session_id: str, answer_id: str, request: Request) -> dict[st
         exam = row_to_dict(conn.execute("SELECT * FROM exams WHERE id = ?", (session["exam_id"],)).fetchone())
 
     result, scorer_provider, scorer_error = score_current_answer(question, answer["answer_text"], exam)
-    response_hash = hashlib.sha256(as_json(result).encode("utf-8")).hexdigest()
-    scoring_status = result.get("status", "scored")
 
     with connect() as conn:
-        conn.execute(
-            """
-            UPDATE answers
-            SET score = ?, max_score = ?, reasoning = ?, scoring_status = ?, scorer_provider = ?, scorer_error = ?,
-                rubric_breakdown_json = ?, expected_points_covered_json = ?, expected_points_missed_json = ?,
-                concerns_json = ?, response_hash = ?
-            WHERE id = ?
-            """,
-            (
-                result["score"],
-                result["max_score"],
-                result["reasoning"],
-                scoring_status,
-                scorer_provider,
-                scorer_error,
-                as_json(result.get("rubric_breakdown", {})),
-                as_json(result.get("expected_points_covered", [])),
-                as_json(result.get("expected_points_missed", [])),
-                as_json(result.get("concerns", [])),
-                response_hash,
-                answer_id,
-            ),
-        )
-        conn.execute(
-            """
-            INSERT INTO scoring_runs (
-                id, answer_id, status, provider, model, score, max_score, rubric_breakdown_json,
-                expected_points_covered_json, expected_points_missed_json, concerns_json, reasoning,
-                prompt_version, response_hash, error, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                str(uuid.uuid4()),
-                answer_id,
-                scoring_status,
-                scorer_provider,
-                result.get("model"),
-                result["score"],
-                result["max_score"],
-                as_json(result.get("rubric_breakdown", {})),
-                as_json(result.get("expected_points_covered", [])),
-                as_json(result.get("expected_points_missed", [])),
-                as_json(result.get("concerns", [])),
-                result["reasoning"],
-                result.get("prompt_version", "v1"),
-                response_hash,
-                scorer_error,
-                utc_now(),
-            ),
-        )
+        scoring_status, _ = persist_scoring(conn, answer_id, result, scorer_provider, scorer_error)
         log_transcript(
             conn,
             session_id,
@@ -1005,6 +1017,13 @@ def rescore_answer(session_id: str, answer_id: str, request: Request) -> dict[st
         # A completed session's final_score was computed with the stale (often zero) score; recompute it.
         if session and session["status"] == "completed":
             finalize_session(conn, session_id)
+
+
+@app.post("/api/review/sessions/{session_id}/answers/{answer_id}/rescore")
+def rescore_answer(session_id: str, answer_id: str, request: Request) -> dict[str, Any]:
+    require_staff(request, {"super_admin", "examiner"})
+    recompute_answer_score(session_id, answer_id, request)
+    with connect() as conn:
         return hydrate_session(conn, session_id, include_private=True)
 
 
@@ -1050,6 +1069,24 @@ def retranscribe_audio(session_id: str, audio_id: str, request: Request) -> dict
             {"audio_id": audio_id, "status": transcript["status"], "provider": transcript["provider"], "model": transcript.get("model"), "error": transcript.get("error"), "text_length": len(transcript["text"] or "")},
         )
         audit_event(conn, "staff", get_auth_session(request, require_csrf=False)["user_id"], "audio_retranscribed", {"session_id": session_id, "audio_id": audio_id, "status": transcript["status"]})
+
+    # A recovered transcript is useless if the graded answer keeps its stale text:
+    # sync it into the linked answer and re-score so the grade reflects the new words.
+    rescored_answer_id: str | None = None
+    if transcript["text"] and transcript["status"] in {"transcribed", "draft_used"}:
+        with connect() as conn:
+            linked = row_to_dict(
+                conn.execute(
+                    "SELECT id FROM answers WHERE session_id = ? AND audio_ref = ? ORDER BY created_at DESC LIMIT 1",
+                    (session_id, audio["storage_path"]),
+                ).fetchone()
+            )
+            if linked:
+                conn.execute("UPDATE answers SET answer_text = ? WHERE id = ?", (transcript["text"].strip(), linked["id"]))
+                log_transcript(conn, session_id, "answer_text_resynced", {"answer_id": linked["id"], "audio_id": audio_id, "text_length": len(transcript["text"].strip())})
+                rescored_answer_id = linked["id"]
+        if rescored_answer_id:
+            recompute_answer_score(session_id, rescored_answer_id, request)
     return {
         "audio_id": audio_id,
         "transcription_status": transcript["status"],
@@ -1057,6 +1094,7 @@ def retranscribe_audio(session_id: str, audio_id: str, request: Request) -> dict
         "transcription_model": transcript.get("model"),
         "transcript_text": transcript["text"],
         "transcription_error": transcript.get("error"),
+        "rescored_answer_id": rescored_answer_id,
     }
 
 
@@ -1555,8 +1593,11 @@ def hydrate_session(conn: Any, session_id: str, include_private: bool = False) -
     session["transcript_events"] = transcript
     session["audio_submissions"] = audio_submissions
     session["rubric"] = session["rubric"] if include_private else None
-    session["score_reviews"] = rows_to_dicts(conn.execute("SELECT * FROM score_reviews WHERE session_id = ? ORDER BY created_at", (session_id,)))
-    apply_effective_score(session, session["score_reviews"])
+    reviews = rows_to_dicts(conn.execute("SELECT * FROM score_reviews WHERE session_id = ? ORDER BY created_at", (session_id,)))
+    # Students see their effective (possibly overridden) grade, but never the reviewer
+    # identity or the private override reason — those stay staff-only.
+    session["score_reviews"] = reviews if include_private else []
+    apply_effective_score(session, reviews, include_private=include_private)
     return session
 
 
@@ -1569,15 +1610,19 @@ def latest_override(conn: Any, session_id: str) -> dict[str, Any] | None:
     )
 
 
-def apply_effective_score(session: dict[str, Any], reviews: list[dict[str, Any]] | None) -> None:
-    """Expose the grade a professor override implies without mutating the AI final_score audit value."""
+def apply_effective_score(session: dict[str, Any], reviews: list[dict[str, Any]] | None, include_private: bool = True) -> None:
+    """Expose the grade a professor override implies without mutating the AI final_score audit value.
+
+    reviewer identity and override reason are staff-only; with include_private=False
+    (student-facing reads) the effective score is still surfaced but those fields are nulled.
+    """
     latest = reviews[-1] if reviews else None
     if latest is not None:
         session["effective_score"] = latest["override_score"]
         session["score_overridden"] = True
         session["score_source"] = "professor_override"
-        session["override_reviewer"] = latest.get("reviewer")
-        session["override_reason"] = latest.get("reason")
+        session["override_reviewer"] = latest.get("reviewer") if include_private else None
+        session["override_reason"] = latest.get("reason") if include_private else None
     else:
         session["effective_score"] = session.get("final_score")
         session["score_overridden"] = False

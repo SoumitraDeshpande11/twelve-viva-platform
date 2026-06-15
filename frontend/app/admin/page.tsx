@@ -30,6 +30,14 @@ export default function AdminPage() {
     setMessage("");
     try {
       const form = new FormData(event.currentTarget);
+      // datetime-local is naive local time; send an offset-aware ISO so the backend
+      // does not reinterpret the admin's local time as UTC.
+      for (const field of ["starts_at", "ends_at"]) {
+        const value = form.get(field);
+        if (typeof value === "string" && value) {
+          form.set(field, new Date(value).toISOString());
+        }
+      }
       const exam = await api<Exam>("/api/admin/exams", { method: "POST", body: form });
       setSelected(exam);
       setExams((current) => [exam, ...current.filter((item) => item.id !== exam.id)]);
