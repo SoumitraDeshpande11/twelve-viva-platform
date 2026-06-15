@@ -34,11 +34,13 @@ npm run build        # next build
 ```
 Config lives in `.env` at **repo root** (copy from `.env.example`). `backend/app/main.py` calls `load_dotenv(parents[2]/.env)` because uvicorn does not load it. `.env` changes need a backend restart (loaded once at import; `--reload` only watches `.py`).
 
-One-command dev + demo:
+First-time setup + dev + demo:
 ```bash
+./setup.sh [--yes]              # one-time: generate secret, pick provider + API keys, install deps, pull ollama model
 ./start.sh [--fresh] [--seed]   # bootstrap venv+node deps, run API+web; --seed adds a demo viva
 python backend/seed_demo.py     # ready-to-take demo (DEMO01 / VIVA-DEMO-2026); loads repo-root .env
 ```
+`setup.sh` writes `.env` (idempotent, value-safe); `start.sh` runs the stack (no npm needed to run — launches Next directly).
 
 ## Architecture
 
