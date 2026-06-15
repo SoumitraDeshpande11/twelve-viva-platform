@@ -1,6 +1,33 @@
 services:
+  api:
+    build: ./backend
+    environment:
+      TWELVE_DATA_DIR: /data
+      # CORS default already allows localhost:3000; override here or via .env if needed.
+      TWELVE_CORS_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "8000:8000"
+    volumes:
+      - twelve_data:/data
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        # Browser runs on the host, so it reaches the API via the published host port.
+        NEXT_PUBLIC_API_BASE: http://127.0.0.1:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+  # Reserved for the production storage/session migration; not used by the SQLite pilot.
   postgres:
     image: postgres:16-alpine
+    profiles: ["prod-infra"]
     environment:
       POSTGRES_DB: twelve
       POSTGRES_USER: twelve
@@ -12,11 +39,13 @@ services:
 
   redis:
     image: redis:7-alpine
+    profiles: ["prod-infra"]
     ports:
       - "6379:6379"
     volumes:
       - twelve_redis:/data
 
 volumes:
+  twelve_data:
   twelve_postgres:
   twelve_redis:
