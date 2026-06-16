@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import secrets
 import hashlib
+import hmac
+import shutil
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -31,6 +33,7 @@ from .auth import (
     hash_opaque_token,
     hash_password,
     is_expired,
+    secret_key,
     session_cookie_options,
     verify_password,
 )
@@ -43,6 +46,14 @@ from .gemini_agent import (
     score_answer_with_gemini,
 )
 from .gemini_voice import GeminiVoiceError, create_live_ephemeral_token, gemini_tts_configured, synthesize_question_wav
+from .ollama_agent import (
+    OllamaAgentError,
+    build_question_plan_with_ollama,
+    create_followup_with_ollama,
+    ollama_configured,
+    ollama_model,
+    score_answer_with_ollama,
+)
 from .openai_agent import (
     OpenAIAgentError,
     build_question_plan_with_openai,
@@ -101,6 +112,9 @@ class ReviewRequest(BaseModel):
     reason: str
 
 
+STAFF_ROLES = {"super_admin", "exam_admin", "examiner", "invigilator"}
+
+
 class LoginRequest(BaseModel):
     email: str
     password: str
@@ -110,6 +124,14 @@ class BootstrapRequest(BaseModel):
     email: str
     name: str
     password: str
+    bootstrap_token: str | None = None
+
+
+class CreateStaffRequest(BaseModel):
+    email: str
+    name: str
+    password: str
+    roles: list[str]
 
 
 class AudioRefRequest(BaseModel):
@@ -139,11 +161,24 @@ def health() -> dict[str, Any]:
         "gemini_configured": gemini_configured(),
         "gemini_tts_configured": gemini_tts_configured(),
         "transcription_provider": transcription_provider(),
+        "ollama_model": ollama_model() if selected_ai_provider() == "ollama" else None,
     }
 
 
 @app.post("/api/auth/bootstrap")
 def bootstrap_admin(payload: BootstrapRequest, response: Response) -> dict[str, Any]:
+    # The first-account endpoint is unauthenticated, so it must be gated or any
+    # visitor could claim super_admin. Require a server-side secret token when one
+    # is configured; outside local/dev/test, refuse entirely if no token is set.
+    expected_token = os.getenv("TWELVE_BOOTSTRAP_TOKEN")
+    if expected_token:
+        if not payload.bootstrap_token or not secrets.compare_digest(payload.bootstrap_token, expected_token):
+            raise HTTPException(status_code=403, detail="Invalid or missing bootstrap token.")
+    elif not local_ai_allowed():
+        raise HTTPException(
+            status_code=403,
+            detail="Bootstrap is disabled. Set TWELVE_BOOTSTRAP_TOKEN (or TWELVE_BOOTSTRAP_ADMIN_*) to create the first account.",
+        )
     with connect() as conn:
         existing = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         if existing:
@@ -153,25 +188,97 @@ def bootstrap_admin(payload: BootstrapRequest, response: Response) -> dict[str, 
         return issue_staff_session(conn, response, user_id)
 
 
-@app.post("/api/auth/login")
-def login(payload: LoginRequest, response: Response) -> dict[str, Any]:
+@app.post("/api/auth/staff")
+def create_staff(payload: CreateStaffRequest, request: Request) -> dict[str, Any]:
+    """Invite an additional staff member. super_admin only (CSRF enforced)."""
+    auth = require_staff(request, {"super_admin"})
+    roles = [role for role in payload.roles if role in STAFF_ROLES]
+    if not roles:
+        raise HTTPException(status_code=400, detail="At least one valid role is required.")
     with connect() as conn:
+        if conn.execute("SELECT 1 FROM users WHERE lower(email) = lower(?)", (payload.email,)).fetchone():
+            raise HTTPException(status_code=409, detail="A user with that email already exists.")
+        user_id = create_staff_user(conn, payload.email, payload.name, payload.password, roles)
+        audit_event(conn, "staff", auth["user_id"], "staff_created", {"email": payload.email, "roles": roles})
+    return {"id": user_id, "email": payload.email.strip().lower(), "name": payload.name.strip(), "roles": roles}
+
+
+@app.post("/api/auth/login")
+def login(payload: LoginRequest, request: Request, response: Response) -> dict[str, Any]:
+    email_key = f"email:{payload.email.strip().lower()}"
+    ip_key = f"ip:{client_ip(request)}"
+    with connect() as conn:
+        enforce_login_rate_limit(conn, email_key, ip_key)
         user = row_to_dict(conn.execute("SELECT * FROM users WHERE lower(email) = lower(?) AND active = 1", (payload.email,)).fetchone())
-        if not user or not verify_password(user["password_hash"], payload.password):
+        login_ok = bool(user) and verify_password(user["password_hash"], payload.password)
+        if not login_ok:
+            # Record the failed attempt against both the email and the source IP so a
+            # later request can be locked out; never reveal which factor was wrong.
+            # Done in its own committed transaction because we raise (which would otherwise
+            # roll back this connection and lose the attempt record).
+            record_failed_login(email_key, ip_key, payload.email.strip().lower(), client_ip(request))
             raise HTTPException(status_code=401, detail="Invalid email or password.")
+        # Successful login clears the throttle window for this email and IP.
+        conn.execute(
+            "DELETE FROM security_audit_events WHERE event_type = 'staff_login_failed' AND actor_id IN (?, ?)",
+            (email_key, ip_key),
+        )
         audit_event(conn, "staff", user["id"], "staff_login", {"email": user["email"]})
         return issue_staff_session(conn, response, user["id"])
+
+
+def record_failed_login(email_key: str, ip_key: str, email: str, ip: str) -> None:
+    with connect() as conn:
+        audit_event(conn, "staff", email_key, "staff_login_failed", {"email": email, "ip": ip})
+        audit_event(conn, "staff", ip_key, "staff_login_failed", {"email": email, "ip": ip})
+
+
+def client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def enforce_login_rate_limit(conn: Any, email_key: str, ip_key: str) -> None:
+    """Lock out staff login after too many recent failures, keyed by email AND source IP.
+
+    Reuses the existing security_audit_events table (same pattern as the provider-token
+    throttle). A 429 is raised before any password check so attempts during a lockout do
+    not extend it further beyond the recorded failures.
+    """
+    window_minutes = int(os.getenv("TWELVE_LOGIN_LOCKOUT_WINDOW_MINUTES", "15"))
+    max_attempts = int(os.getenv("TWELVE_LOGIN_MAX_ATTEMPTS", "5"))
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=window_minutes)).isoformat()
+    for key in (email_key, ip_key):
+        failures = conn.execute(
+            "SELECT COUNT(*) FROM security_audit_events WHERE event_type = 'staff_login_failed' AND actor_id = ? AND created_at >= ?",
+            (key, cutoff),
+        ).fetchone()[0]
+        if failures >= max_attempts:
+            raise HTTPException(status_code=429, detail="Too many failed login attempts. Try again later.")
 
 
 @app.post("/api/auth/logout")
 def logout(request: Request, response: Response) -> dict[str, Any]:
     token = request.cookies.get(AUTH_COOKIE)
+    role: str | None = None
     with connect() as conn:
         if token:
+            session = row_to_dict(
+                conn.execute("SELECT * FROM auth_sessions WHERE token_hash = ?", (hash_opaque_token(token),)).fetchone()
+            )
+            if session:
+                role = session["role"]
+                # Record deliberate session ends so we retain an audit trail of who
+                # logged out (and when) — important on shared/lab machines. Role-agnostic
+                # behaviour is preserved; this only adds the event.
+                actor_id = session.get("student_id") if role == "student" else session.get("user_id")
+                audit_event(conn, role, actor_id, f"{role}_logout", {"session_id": session["id"]})
             conn.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (hash_opaque_token(token),))
     response.delete_cookie(AUTH_COOKIE, path="/")
     response.delete_cookie(CSRF_COOKIE, path="/")
-    return {"ok": True}
+    return {"ok": True, "role": role}
 
 
 @app.get("/api/auth/me")
@@ -232,10 +339,18 @@ async def create_exam(
     ends_at_value = ends_at_dt.isoformat() if ends_at_dt else None
     exam_id = str(uuid.uuid4())
     now = utc_now()
+    max_upload_bytes = int(os.getenv("TWELVE_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
     csv_bytes = await student_csv.read()
+    if len(csv_bytes) > max_upload_bytes:
+        raise HTTPException(status_code=413, detail="Student CSV upload is too large.")
     students = parse_students_csv(csv_bytes)
     if not students:
         raise HTTPException(status_code=400, detail="Student CSV did not contain any rows.")
+    raw_row_count = csv_row_count(csv_bytes)
+    skipped_rows = max(raw_row_count - len(students), 0)
+    warnings: list[str] = []
+    if skipped_rows:
+        warnings.append(f"{skipped_rows} CSV row(s) were skipped (e.g. missing roll_number or malformed).")
 
     exam_dir = UPLOAD_DIR / exam_id
     exam_dir.mkdir(parents=True, exist_ok=True)
@@ -272,6 +387,8 @@ async def create_exam(
 
         for upload in submissions:
             content = await upload.read()
+            if len(content) > max_upload_bytes:
+                raise HTTPException(status_code=413, detail=f"Submission upload '{upload.filename or 'file'}' is too large.")
             filename = Path(upload.filename or "submission.bin").name
             storage_name = f"{uuid.uuid4()}-{filename}"
             storage_path = exam_dir / storage_name
@@ -298,6 +415,8 @@ async def create_exam(
     exam = get_exam_for_response(exam_id)
     for student in exam["students"]:
         student["token"] = issued_tokens.get(student["id"])
+    exam["skipped_rows"] = skipped_rows
+    exam["warnings"] = warnings
     return exam
 
 
@@ -316,6 +435,55 @@ def list_exams(request: Request) -> list[dict[str, Any]]:
 def get_exam(exam_id: str, request: Request) -> dict[str, Any]:
     require_staff(request, {"super_admin", "exam_admin", "examiner", "invigilator"})
     return get_exam_for_response(exam_id)
+
+
+@app.delete("/api/admin/exams/{exam_id}", status_code=204)
+def delete_exam(exam_id: str, request: Request) -> Response:
+    auth = require_staff(request, {"super_admin", "exam_admin"})
+    with connect() as conn:
+        if not conn.execute("SELECT 1 FROM exams WHERE id = ?", (exam_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Exam not found")
+        # Collect session ids first so we can remove their on-disk media after the cascade.
+        session_ids = [row["id"] for row in conn.execute("SELECT id FROM viva_sessions WHERE exam_id = ?", (exam_id,))]
+        # FK ON DELETE CASCADE (PRAGMA foreign_keys=ON in storage.connect) removes the
+        # exam's students, sessions, answers, questions, transcript/proctoring/audio/recording rows.
+        conn.execute("DELETE FROM exams WHERE id = ?", (exam_id,))
+        audit_event(conn, "staff", auth["user_id"], "exam_deleted", {"exam_id": exam_id})
+    # The DB rows cascade, but the recorded files do not — remove the per-session dirs.
+    for session_id in session_ids:
+        shutil.rmtree(UPLOAD_DIR / "recordings" / session_id, ignore_errors=True)
+        shutil.rmtree(UPLOAD_DIR / "audio" / session_id, ignore_errors=True)
+    return Response(status_code=204)
+
+
+@app.post("/api/admin/exams/{exam_id}/students/{student_id}/reset-attempt")
+def reset_student_attempt(exam_id: str, student_id: str, request: Request) -> dict[str, Any]:
+    auth = require_staff(request, {"super_admin", "exam_admin"})
+    now = utc_now()
+    new_token = generate_token(24)
+    with connect() as conn:
+        student = row_to_dict(
+            conn.execute("SELECT * FROM students WHERE id = ? AND exam_id = ?", (student_id, exam_id)).fetchone()
+        )
+        if not student:
+            raise HTTPException(status_code=404, detail="Student not found for this exam.")
+        # Invalidate any existing attempt: mark active/used sessions reset and drop their auth sessions.
+        sessions = rows_to_dicts(
+            conn.execute("SELECT id FROM viva_sessions WHERE student_id = ? AND exam_id = ?", (student_id, exam_id))
+        )
+        for session in sessions:
+            conn.execute(
+                "UPDATE viva_sessions SET status = ?, ended_at = COALESCE(ended_at, ?) WHERE id = ? AND status = 'active'",
+                ("reset", now, session["id"]),
+            )
+            conn.execute("DELETE FROM auth_sessions WHERE viva_session_id = ?", (session["id"],))
+        # Regenerate a fresh one-time code and clear the used/active markers so the student can restart.
+        conn.execute(
+            "UPDATE students SET token_hash = ?, token_issued_at = ?, token_used_at = NULL, active_session_id = NULL WHERE id = ?",
+            (hash_opaque_token(new_token), now, student_id),
+        )
+        audit_event(conn, "staff", auth["user_id"], "student_attempt_reset", {"exam_id": exam_id, "student_id": student_id})
+    return {"student_id": student_id, "roll_number": student["roll_number"], "token": new_token}
 
 
 def get_exam_for_response(exam_id: str) -> dict[str, Any]:
@@ -348,7 +516,18 @@ def public_exam_landing(exam_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/student/attempts/start")
-def start_session(payload: StartSessionRequest, response: Response) -> dict[str, Any]:
+def start_session(payload: StartSessionRequest, request: Request, response: Response) -> dict[str, Any]:
+    # Staff must not sit a viva (they create exams and know the codes — conflict of
+    # interest). Reject if a staff session cookie is present; they must log out first.
+    staff_token = request.cookies.get(AUTH_COOKIE)
+    if staff_token:
+        with connect() as conn:
+            existing = row_to_dict(
+                conn.execute("SELECT role, expires_at FROM auth_sessions WHERE token_hash = ?", (hash_opaque_token(staff_token),)).fetchone()
+            )
+        if existing and existing.get("role") == "staff" and not is_expired(existing["expires_at"]):
+            raise HTTPException(status_code=403, detail="Staff accounts cannot take a viva. Log out first.")
+
     if not (payload.permissions.camera and payload.permissions.microphone and payload.permissions.fullscreen):
         raise HTTPException(status_code=403, detail="Camera, microphone, and fullscreen permissions are required before starting.")
 
@@ -440,8 +619,8 @@ def start_session(payload: StartSessionRequest, response: Response) -> dict[str,
 
 
 @app.post("/api/sessions/start")
-def deprecated_start_session(payload: StartSessionRequest, response: Response) -> dict[str, Any]:
-    return start_session(payload, response)
+def deprecated_start_session(payload: StartSessionRequest, request: Request, response: Response) -> dict[str, Any]:
+    return start_session(payload, request, response)
 
 
 @app.get("/api/sessions/{session_id}")
@@ -480,7 +659,7 @@ def question_tts(session_id: str, question_id: str, request: Request) -> FileRes
 
 @app.post("/api/sessions/{session_id}/answer")
 def submit_answer(session_id: str, payload: AnswerRequest, request: Request) -> dict[str, Any]:
-    require_session_access(request, session_id)
+    require_session_access(request, session_id, student_only=True)
     return submit_answer_for_session(session_id, payload, request)
 
 
@@ -553,7 +732,7 @@ def submit_answer_for_session(session_id: str, payload: AnswerRequest, request: 
         log_transcript(conn, session_id, "answer_received", {"question_id": payload.question_id, "answer_id": answer_id, "input_mode": payload.input_mode})
 
     result, scorer_provider, scorer_error = score_current_answer(question, answer_text, exam)
-    response_hash = hashlib.sha256(as_json(result).encode("utf-8")).hexdigest()
+    response_hash = hmac_hex(as_json(result))
     scoring_status = result.get("status", "scored")
 
     with connect() as conn:
@@ -682,7 +861,7 @@ def submit_answer_for_session(session_id: str, payload: AnswerRequest, request: 
 
 @app.post("/api/sessions/{session_id}/audio")
 async def upload_audio(session_id: str, request: Request, audio: UploadFile = File(...)) -> dict[str, Any]:
-    require_session_access(request, session_id)
+    require_session_access(request, session_id, student_only=True)
     draft_transcript = (await request.form()).get("draft_transcript")
     return await upload_audio_for_session(session_id, audio, str(draft_transcript or ""))
 
@@ -698,11 +877,67 @@ async def upload_current_audio(request: Request, audio: UploadFile = File(...)) 
     return await upload_audio_for_session(auth["viva_session_id"], audio, draft_transcript)
 
 
+@app.post("/api/sessions/{session_id}/recording")
+async def upload_recording(session_id: str, request: Request, recording: UploadFile = File(...)) -> dict[str, Any]:
+    require_session_access(request, session_id, student_only=True)
+    return await store_session_recording(session_id, recording)
+
+
+@app.post("/api/student/attempts/current/recording")
+async def upload_current_recording(request: Request, recording: UploadFile = File(...)) -> dict[str, Any]:
+    auth = require_student_attempt(request)
+    form = await request.form()
+    file = form.get("recording")
+    if isinstance(file, UploadFile):
+        recording = file
+    return await store_session_recording(auth["viva_session_id"], recording)
+
+
+async def store_session_recording(session_id: str, recording: UploadFile) -> dict[str, Any]:
+    """Persist the full-viva webcam recording for examiner review (review-only, never scored)."""
+    with connect() as conn:
+        session = row_to_dict(conn.execute("SELECT * FROM viva_sessions WHERE id = ?", (session_id,)).fetchone())
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if session["status"] != "active":
+            raise HTTPException(status_code=409, detail="Session is not active")
+    content = await recording.read()
+    max_bytes = int(os.getenv("TWELVE_MAX_VIDEO_BYTES", str(500 * 1024 * 1024)))
+    if len(content) > max_bytes:
+        raise HTTPException(status_code=413, detail="Recording upload is too large.")
+    if not content:
+        raise HTTPException(status_code=400, detail="Recording is empty.")
+    recording_dir = UPLOAD_DIR / "recordings" / session_id
+    recording_dir.mkdir(parents=True, exist_ok=True)
+    extension = Path(recording.filename or "viva.webm").suffix or ".webm"
+    storage_path = recording_dir / f"{uuid.uuid4()}{extension}"
+    storage_path.write_bytes(content)
+    recording_id = str(uuid.uuid4())
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO session_recordings (id, session_id, storage_path, mime_type, size_bytes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (recording_id, session_id, str(storage_path), recording.content_type, len(content), now),
+        )
+        log_transcript(
+            conn,
+            session_id,
+            "recording_uploaded",
+            {"recording_id": recording_id, "mime_type": recording.content_type, "size_bytes": len(content)},
+        )
+    return {"recording_id": recording_id, "size_bytes": len(content)}
+
+
 async def upload_audio_for_session(session_id: str, audio: UploadFile, draft_transcript: str = "") -> dict[str, Any]:
     with connect() as conn:
         session = row_to_dict(conn.execute("SELECT * FROM viva_sessions WHERE id = ?", (session_id,)).fetchone())
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
+        if session["status"] != "active":
+            raise HTTPException(status_code=409, detail="Session is not active")
     content = await audio.read()
     max_bytes = int(os.getenv("TWELVE_MAX_AUDIO_BYTES", str(25 * 1024 * 1024)))
     if len(content) > max_bytes:
@@ -814,7 +1049,10 @@ def canonical_answer_text(conn: Any, session_id: str, payload: AnswerRequest) ->
         raise HTTPException(status_code=404, detail="Audio reference was not found for this attempt.")
     if audio["transcription_status"] in {"transcribed", "draft_used"} and audio.get("transcript_text"):
         return audio["transcript_text"].strip()
-    if os.getenv("TWELVE_ENV", "local").strip().lower() in {"local", "development", "test"} and payload.answer_text.strip():
+    # Self-supplied browser draft as the scored source is a non-prod convenience only.
+    # DEFAULT-DENY: an unset/unknown TWELVE_ENV is treated as production, so a real deploy
+    # that forgot to set the env can never accept a client-supplied transcript as truth.
+    if self_supplied_transcript_allowed() and payload.answer_text.strip():
         conn.execute(
             """
             UPDATE audio_submissions
@@ -829,7 +1067,7 @@ def canonical_answer_text(conn: Any, session_id: str, payload: AnswerRequest) ->
 
 @app.post("/api/sessions/{session_id}/proctoring-events")
 def log_proctoring_event(session_id: str, payload: ProctoringEventRequest, request: Request) -> dict[str, Any]:
-    require_session_access(request, session_id)
+    require_session_access(request, session_id, student_only=True)
     return log_proctoring_for_session(session_id, payload)
 
 
@@ -900,7 +1138,7 @@ def log_proctoring_for_session(session_id: str, payload: ProctoringEventRequest)
 
 @app.post("/api/sessions/{session_id}/finalize")
 def finalize(session_id: str, request: Request) -> dict[str, Any]:
-    require_session_access(request, session_id)
+    require_session_access(request, session_id, student_only=True)
     with connect() as conn:
         finalize_session(conn, session_id)
         return hydrate_session(conn, session_id)
@@ -932,7 +1170,7 @@ def create_score_review(session_id: str, payload: ReviewRequest, request: Reques
 
 def persist_scoring(conn: Any, answer_id: str, result: dict[str, Any], scorer_provider: str, scorer_error: str | None) -> tuple[str, str]:
     """Write a scoring result onto an answer and append an immutable scoring_runs record."""
-    response_hash = hashlib.sha256(as_json(result).encode("utf-8")).hexdigest()
+    response_hash = hmac_hex(as_json(result))
     scoring_status = result.get("status", "scored")
     conn.execute(
         """
@@ -1015,7 +1253,8 @@ def recompute_answer_score(session_id: str, answer_id: str, request: Request) ->
         )
         audit_event(conn, "staff", get_auth_session(request, require_csrf=False)["user_id"], "answer_rescored", {"session_id": session_id, "answer_id": answer_id, "status": scoring_status})
         # A completed session's final_score was computed with the stale (often zero) score; recompute it.
-        if session and session["status"] == "completed":
+        # needs_review sessions (all answers had pending_ai_error) also re-finalize once a rescore succeeds.
+        if session and session["status"] in {"completed", "needs_review"}:
             finalize_session(conn, session_id)
 
 
@@ -1158,6 +1397,18 @@ def review_audio(ref: str, request: Request) -> FileResponse:
     if not path.exists() or not path.is_file():
         raise HTTPException(status_code=404, detail="Audio not found.")
     return FileResponse(path, media_type="audio/webm", filename=path.name)
+
+
+@app.get("/api/review/recording")
+def review_recording(ref: str, request: Request) -> FileResponse:
+    require_staff(request, {"super_admin", "examiner", "invigilator"})
+    path = Path(ref).resolve()
+    upload_root = UPLOAD_DIR.resolve()
+    if upload_root not in path.parents:
+        raise HTTPException(status_code=403, detail="Recording reference is not available.")
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Recording not found.")
+    return FileResponse(path, media_type="video/webm", filename=path.name)
 
 
 @app.post("/api/realtime/token")
@@ -1332,13 +1583,23 @@ def require_student_attempt(request: Request) -> dict[str, Any]:
     return auth
 
 
-def require_session_access(request: Request, session_id: str, require_csrf: bool = True) -> dict[str, Any]:
+def require_session_access(request: Request, session_id: str, require_csrf: bool = True, student_only: bool = False) -> dict[str, Any]:
+    """Authorize access to a viva session via the legacy /api/sessions/{id} routes.
+
+    Students may only touch their own attempt. Staff get READ access to any session
+    (the /review flows rely on this). student_only=True marks a write path that
+    belongs to the student attempt lifecycle (answering, audio, proctoring, finalize):
+    staff must NOT drive a student's session through those, so they are rejected even
+    though staff can still read it.
+    """
     auth = get_auth_session(request, require_csrf=require_csrf)
     if auth["role"] == "student":
         if auth.get("viva_session_id") != session_id:
             raise HTTPException(status_code=403, detail="Attempt ownership required.")
         return auth
     if auth["role"] == "staff":
+        if student_only:
+            raise HTTPException(status_code=403, detail="Staff cannot perform student attempt actions on a session.")
         return require_staff(request, {"super_admin", "exam_admin", "examiner", "invigilator"})
     raise HTTPException(status_code=403, detail="Access denied.")
 
@@ -1376,6 +1637,25 @@ def audit_event(conn: Any, actor_type: str, actor_id: str | None, event_type: st
     )
 
 
+def csv_row_count(csv_bytes: bytes) -> int:
+    """Best-effort count of non-empty CSV data rows (excludes the header).
+
+    parse_students_csv() is owned by another module and may silently drop rows
+    (e.g. missing roll_number). Comparing this raw count against the parsed count
+    lets create_exam surface a skipped-row warning without editing that module.
+    """
+    try:
+        import csv as _csv
+        import io as _io
+
+        text = csv_bytes.decode("utf-8-sig", errors="replace")
+        reader = _csv.reader(_io.StringIO(text))
+        rows = [row for row in reader if any((cell or "").strip() for cell in row)]
+        return max(len(rows) - 1, 0)  # subtract the header row
+    except Exception:
+        return 0
+
+
 def infer_student_id(filename: str, student_ids: dict[str, str]) -> str | None:
     lowered = filename.lower()
     for roll, student_id in student_ids.items():
@@ -1395,6 +1675,11 @@ def make_question_plan(exam: dict[str, Any], student: dict[str, Any], submission
         try:
             return build_question_plan_with_gemini(exam, student, submission_text), "gemini", None
         except GeminiAgentError as exc:
+            return build_question_plan(exam, student, submission_text), "local-fallback", str(exc)
+    if provider == "ollama":
+        try:
+            return build_question_plan_with_ollama(exam, student, submission_text), "ollama", None
+        except OllamaAgentError as exc:
             return build_question_plan(exam, student, submission_text), "local-fallback", str(exc)
     return build_question_plan(exam, student, submission_text), "local", None
 
@@ -1427,6 +1712,19 @@ def score_current_answer(question: dict[str, Any], answer_text: str, exam: dict[
                 result["model"] = "local"
                 return result, "local-fallback", str(exc)
             return pending_ai_error_result(str(exc)), "gemini", str(exc)
+    if provider == "ollama":
+        try:
+            result = score_answer_with_ollama(question, answer_text, exam["rubric"], exam)
+            result["status"] = "scored"
+            result["model"] = ollama_model()
+            return result, "ollama", None
+        except OllamaAgentError as exc:
+            if local_ai_allowed():
+                result = score_answer(question, answer_text, exam["rubric"])
+                result["status"] = "scored"
+                result["model"] = "local"
+                return result, "local-fallback", str(exc)
+            return pending_ai_error_result(str(exc)), "ollama", str(exc)
     result = score_answer(question, answer_text, exam["rubric"])
     result["status"] = "scored"
     result["model"] = "local"
@@ -1452,6 +1750,16 @@ def local_ai_allowed() -> bool:
     return os.getenv("TWELVE_ENV", "local").strip().lower() in {"local", "development", "test"}
 
 
+def self_supplied_transcript_allowed() -> bool:
+    """Whether a client-supplied browser draft may stand in as the scored answer source.
+
+    Unlike local_ai_allowed(), this does NOT default to a permissive env: an unset or
+    unknown TWELVE_ENV is treated as production (deny). Only an explicit local/dev/test
+    env opts in. This keeps a misconfigured real deploy from trusting client transcripts.
+    """
+    return os.getenv("TWELVE_ENV", "").strip().lower() in {"local", "development", "test"}
+
+
 def create_next_followup(question: dict[str, Any], answer_text: str, exam: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
     if question["category"] == "follow-up":
         return None, None, None
@@ -1466,6 +1774,11 @@ def create_next_followup(question: dict[str, Any], answer_text: str, exam: dict[
             return create_followup_with_gemini(question, answer_text, exam["rubric"]), "gemini", None
         except GeminiAgentError as exc:
             return create_followup(question, answer_text), "local-fallback", str(exc)
+    if provider == "ollama":
+        try:
+            return create_followup_with_ollama(question, answer_text, exam["rubric"]), "ollama", None
+        except OllamaAgentError as exc:
+            return create_followup(question, answer_text), "local-fallback", str(exc)
     return create_followup(question, answer_text), "local", None
 
 
@@ -1477,11 +1790,23 @@ def selected_ai_provider() -> str:
         return "openai" if openai_configured() else "local"
     if provider == "gemini":
         return "gemini" if gemini_configured() else "local"
+    if provider == "ollama":
+        return "ollama" if ollama_configured() else "local"
     if openai_configured():
         return "openai"
     if gemini_configured():
         return "gemini"
     return "local"
+
+
+def hmac_hex(data: str) -> str:
+    """Keyed (HMAC-SHA256) tamper-evidence digest.
+
+    Used for answer response_hash and the transcript hash chain. Keying with the
+    server secret stops a DB-level attacker from recomputing valid hashes after
+    editing rows; a plain sha256 would be trivially forgeable.
+    """
+    return hmac.new(secret_key(), data.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def log_transcript(conn: Any, session_id: str, event_type: str, payload: dict[str, Any]) -> None:
@@ -1495,7 +1820,7 @@ def log_transcript(conn: Any, session_id: str, event_type: str, payload: dict[st
     prev_hash = previous["event_hash"] if previous else ""
     created_at = utc_now()
     payload_json = as_json(payload)
-    event_hash = hashlib.sha256(f"{session_id}|{sequence}|{prev_hash}|{event_type}|{payload_json}|{created_at}".encode("utf-8")).hexdigest()
+    event_hash = hmac_hex(f"{session_id}|{sequence}|{prev_hash}|{event_type}|{payload_json}|{created_at}")
     conn.execute(
         """
         INSERT INTO transcript_events (id, session_id, type, payload_json, created_at, sequence, prev_hash, event_hash)
@@ -1506,12 +1831,27 @@ def log_transcript(conn: Any, session_id: str, event_type: str, payload: dict[st
 
 
 def finalize_session(conn: Any, session_id: str) -> None:
-    answers = rows_to_dicts(conn.execute("SELECT score, max_score FROM answers WHERE session_id = ?", (session_id,)))
-    if not answers:
+    answers = rows_to_dicts(conn.execute("SELECT score, max_score, scoring_status FROM answers WHERE session_id = ?", (session_id,)))
+    # Answers whose AI scoring failed in staging/prod carry scoring_status=pending_ai_error
+    # and a placeholder score of 0. Including them would fabricate a misleadingly low final
+    # shown to the student. Exclude them from the mean (final = answer-scores only), and if
+    # EVERY answer is unscored, route the session to needs_review instead of emitting a fake 0.
+    scored = [a for a in answers if a.get("scoring_status") != "pending_ai_error"]
+    pending = [a for a in answers if a.get("scoring_status") == "pending_ai_error"]
+    if answers and not scored:
+        # Nothing could be scored — do not show a 0; flag for professor review.
+        conn.execute(
+            "UPDATE viva_sessions SET status = ?, final_score = ?, ended_at = COALESCE(ended_at, ?) WHERE id = ?",
+            ("needs_review", None, utc_now(), session_id),
+        )
+        conn.execute("UPDATE students SET active_session_id = NULL WHERE active_session_id = ?", (session_id,))
+        log_transcript(conn, session_id, "session_needs_review", {"reason": "all_answers_pending_ai_error", "pending_count": len(pending)})
+        return
+    if not scored:
         final_score = 0.0
     else:
-        earned = sum(answer["score"] for answer in answers)
-        possible = sum(answer["max_score"] for answer in answers)
+        earned = sum(answer["score"] for answer in scored)
+        possible = sum(answer["max_score"] for answer in scored)
         final_score = round((earned / possible) * 100, 1) if possible else 0.0
     conn.execute(
         "UPDATE viva_sessions SET status = ?, final_score = ?, ended_at = COALESCE(ended_at, ?) WHERE id = ?",
@@ -1586,6 +1926,20 @@ def hydrate_session(conn: Any, session_id: str, include_private: bool = False) -
     session["proctoring_events"] = proctoring
     session["transcript_events"] = transcript
     session["audio_submissions"] = audio_submissions
+    # Webcam recordings are staff-review-only; never expose the refs to the student.
+    session["recordings"] = (
+        rows_to_dicts(
+            conn.execute(
+                """
+                SELECT id, storage_path AS ref, mime_type, size_bytes, created_at
+                FROM session_recordings WHERE session_id = ? ORDER BY created_at
+                """,
+                (session_id,),
+            )
+        )
+        if include_private
+        else []
+    )
     session["rubric"] = session["rubric"] if include_private else None
     # Deterministic tie-break (created_at, rowid) so reviews[-1] is the same newest
     # override that latest_override resolves to for the list endpoints.

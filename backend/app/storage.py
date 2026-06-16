@@ -33,8 +33,13 @@ def from_json(value: str | None, fallback: Any = None) -> Any:
 def connect() -> Iterable[sqlite3.Connection]:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5.0)
     conn.row_factory = sqlite3.Row
+    # Concurrency hardening: WAL allows concurrent readers with a writer, and
+    # busy_timeout makes writers wait for the lock instead of failing immediately
+    # with "database is locked" under concurrent vivas. All idempotent per-connect.
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA foreign_keys = ON")
     try:
         yield conn
@@ -264,6 +269,21 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_sessions_token ON auth_sessions(token_hash)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_transcript_session_sequence ON transcript_events(session_id, sequence)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_audio_submissions_session ON audio_submissions(session_id, created_at)")
+
+    # Full-viva webcam recordings for examiner review (review-only, never scored).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_recordings (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES viva_sessions(id) ON DELETE CASCADE,
+            storage_path TEXT NOT NULL,
+            mime_type TEXT,
+            size_bytes INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_session_recordings_session ON session_recordings(session_id, created_at)")
 
 
 def add_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:

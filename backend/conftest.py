@@ -10,6 +10,9 @@ os.environ["TWELVE_AI_PROVIDER"] = "local"
 os.environ["TWELVE_TRANSCRIPTION_PROVIDER"] = "local"
 os.environ.pop("TWELVE_BOOTSTRAP_ADMIN_EMAIL", None)
 os.environ.pop("TWELVE_BOOTSTRAP_ADMIN_PASSWORD", None)
+# Pre-seed empty so load_dotenv(override=False) in app.main won't pull a real
+# TWELVE_BOOTSTRAP_TOKEN from the developer's .env into the isolated test env.
+os.environ["TWELVE_BOOTSTRAP_TOKEN"] = ""
 
 import pytest
 from fastapi.testclient import TestClient

@@ -19,9 +19,21 @@ SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 _password_hasher = PasswordHasher()
 
+_LOCAL_ENVS = {"local", "development", "test"}
+_DEV_SECRET_FALLBACK = "twelve-local-dev-secret"
+
 
 def secret_key() -> bytes:
-    value = os.getenv("TWELVE_SECRET_KEY") or os.getenv("TWELVE_TOKEN_PEPPER") or "twelve-local-dev-secret"
+    value = os.getenv("TWELVE_SECRET_KEY") or os.getenv("TWELVE_TOKEN_PEPPER")
+    if not value:
+        env = os.getenv("TWELVE_ENV", "local").lower()
+        if env not in _LOCAL_ENVS:
+            raise RuntimeError(
+                "TWELVE_SECRET_KEY (or TWELVE_TOKEN_PEPPER) must be set when "
+                f"TWELVE_ENV={env!r}. Refusing to start with the insecure dev fallback "
+                "secret in a non-local deployment."
+            )
+        value = _DEV_SECRET_FALLBACK
     return value.encode("utf-8")
 
 

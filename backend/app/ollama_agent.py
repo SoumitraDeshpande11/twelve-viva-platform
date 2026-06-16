@@ -1,3 +1,10 @@
+"""Local-LLM provider backed by Ollama (cross-platform: Linux + macOS/Metal).
+
+Mirrors gemini_agent / openai_agent: each function raises OllamaAgentError on failure so
+the dispatcher in main.py can fall back to the deterministic local heuristic. Uses the
+Ollama HTTP API's structured-output `format` field (a JSON schema) to get parseable JSON.
+No model runs in-process — it talks to a local `ollama serve` (default :11434).
+"""
 from __future__ import annotations
 
 import json
@@ -8,42 +15,42 @@ import httpx
 
 from .agent import QUESTION_CATEGORIES, QuestionSeed
 
+DEFAULT_MODEL = "llama3.2:3b"
 
-DEFAULT_MODEL = "gemini-3.5-flash"
 
-
-class GeminiAgentError(RuntimeError):
+class OllamaAgentError(RuntimeError):
     pass
 
 
-def gemini_configured() -> bool:
-    return bool(os.getenv("GEMINI_API_KEY"))
+def ollama_host() -> str:
+    return os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
 
 
-def build_question_plan_with_gemini(exam: dict[str, Any], student: dict[str, Any], submission_text: str) -> list[QuestionSeed]:
+def ollama_model() -> str:
+    return os.getenv("OLLAMA_MODEL", DEFAULT_MODEL)
+
+
+def ollama_configured() -> bool:
+    # The model server is local; assume available when selected. A down/unreachable server
+    # surfaces as an OllamaAgentError at call time, which the dispatcher falls back from.
+    return True
+
+
+def build_question_plan_with_ollama(exam: dict[str, Any], student: dict[str, Any], submission_text: str) -> list[QuestionSeed]:
     payload = call_structured_response(
         schema={
             "type": "object",
-            "additionalProperties": False,
             "required": ["questions"],
             "properties": {
                 "questions": {
                     "type": "array",
-                    "minItems": 5,
-                    "maxItems": 5,
                     "items": {
                         "type": "object",
-                        "additionalProperties": False,
                         "required": ["category", "text", "expected_points"],
                         "properties": {
                             "category": {"type": "string", "enum": QUESTION_CATEGORIES},
                             "text": {"type": "string"},
-                            "expected_points": {
-                                "type": "array",
-                                "minItems": 3,
-                                "maxItems": 5,
-                                "items": {"type": "string"},
-                            },
+                            "expected_points": {"type": "array", "items": {"type": "string"}},
                         },
                     },
                 }
@@ -52,7 +59,8 @@ def build_question_plan_with_gemini(exam: dict[str, Any], student: dict[str, Any
         instructions=(
             "You are TWELVE, an academic viva examiner for a BTech CSE project viva. "
             "Create exactly five concise, fair, exam-ready questions. Ask exactly one thing per question. "
-            "Use the required categories exactly once each. Do not reveal expected points to the student."
+            "Use each of the required categories exactly once. Each question needs 3-5 expected_points. "
+            "Do not reveal expected points to the student."
         ),
         user_input={
             "task": "Create a five-question viva plan.",
@@ -64,41 +72,39 @@ def build_question_plan_with_gemini(exam: dict[str, Any], student: dict[str, Any
                 "curriculum": trim(exam["curriculum"], 5000),
                 "rubric": trim(exam["rubric"], 5000),
             },
-            "submission_excerpt": trim(submission_text, 18000),
+            "submission_excerpt": trim(submission_text, 12000),
         },
     )
-    questions = payload["questions"]
+    questions = payload.get("questions", [])
     if len(questions) != 5:
-        raise GeminiAgentError(f"Gemini returned {len(questions)} questions; expected 5")
-
+        raise OllamaAgentError(f"Ollama returned {len(questions)} questions; expected 5")
     normalized = [
         QuestionSeed(
             category=question["category"],
-            text=question["text"].strip(),
-            expected_points=[point.strip() for point in question["expected_points"] if point.strip()][:5],
+            text=str(question["text"]).strip(),
+            expected_points=[str(point).strip() for point in question.get("expected_points", []) if str(point).strip()][:5],
         )
         for question in questions
     ]
     if any(not question.text or len(question.expected_points) < 2 for question in normalized):
-        raise GeminiAgentError("Gemini returned incomplete questions")
+        raise OllamaAgentError("Ollama returned incomplete questions")
     return normalized
 
 
-def score_answer_with_gemini(question: dict[str, Any], answer_text: str, rubric: str, exam: dict[str, Any]) -> dict[str, Any]:
+def score_answer_with_ollama(question: dict[str, Any], answer_text: str, rubric: str, exam: dict[str, Any]) -> dict[str, Any]:
     payload = call_structured_response(
         schema={
             "type": "object",
-            "additionalProperties": False,
             "required": ["score", "max_score", "reasoning"],
             "properties": {
-                "score": {"type": "number", "minimum": 0, "maximum": 10},
+                "score": {"type": "number"},
                 "max_score": {"type": "number"},
                 "reasoning": {"type": "string"},
             },
         },
         instructions=(
-            "You are TWELVE's scoring specialist. Grade only the answer to the current question. "
-            "Use the rubric and expected points, but do not let proctoring or behavior affect marks. "
+            "You are TWELVE's scoring specialist. Grade only the answer to the current question, out of 10. "
+            "Use the rubric and expected points. Do not let proctoring or behavior affect marks. "
             "Be strict, fair, and concise."
         ),
         user_input={
@@ -120,15 +126,14 @@ def score_answer_with_gemini(question: dict[str, Any], answer_text: str, rubric:
     return {
         "score": max(0.0, min(10.0, round(float(payload["score"]), 1))),
         "max_score": 10.0,
-        "reasoning": payload["reasoning"].strip(),
+        "reasoning": str(payload["reasoning"]).strip(),
     }
 
 
-def create_followup_with_gemini(question: dict[str, Any], answer_text: str, rubric: str) -> str | None:
+def create_followup_with_ollama(question: dict[str, Any], answer_text: str, rubric: str) -> str | None:
     payload = call_structured_response(
         schema={
             "type": "object",
-            "additionalProperties": False,
             "required": ["should_ask", "question"],
             "properties": {
                 "should_ask": {"type": "boolean"},
@@ -150,73 +155,41 @@ def create_followup_with_gemini(question: dict[str, Any], answer_text: str, rubr
             "student_answer": trim(answer_text, 8000),
         },
     )
-    followup = payload["question"].strip()
-    return followup if payload["should_ask"] and followup else None
-
-
-def sanitize_schema(node: Any) -> Any:
-    """Strip JSON-Schema keywords the Gemini responseSchema field rejects (e.g. additionalProperties)."""
-    if isinstance(node, dict):
-        return {k: sanitize_schema(v) for k, v in node.items() if k != "additionalProperties"}
-    if isinstance(node, list):
-        return [sanitize_schema(v) for v in node]
-    return node
+    followup = str(payload.get("question", "")).strip()
+    return followup if payload.get("should_ask") and followup else None
 
 
 def call_structured_response(schema: dict[str, Any], instructions: str, user_input: dict[str, Any]) -> dict[str, Any]:
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise GeminiAgentError("GEMINI_API_KEY is not configured")
-
-    schema = sanitize_schema(schema)
-    model = os.getenv("GEMINI_VIVA_MODEL", DEFAULT_MODEL)
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    request = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": (
-                            f"{instructions}\n\n"
-                            "Return only JSON matching the configured schema.\n\n"
-                            f"Input JSON:\n{json.dumps(user_input, ensure_ascii=True)}"
-                        )
-                    }
-                ]
-            }
+    # Use Ollama's OpenAI-compatible endpoint (/v1/chat/completions): it is the most
+    # portable surface across Ollama builds/platforms (incl. macOS). JSON mode + an
+    # explicit schema in the prompt give us parseable structured output.
+    system = f"{instructions}\nRespond with ONLY a JSON object matching this schema:\n{json.dumps(schema)}"
+    body = {
+        "model": ollama_model(),
+        "stream": False,
+        "temperature": float(os.getenv("OLLAMA_TEMPERATURE", "0.2")),
+        # Cap output length so a chatty model can't run long — bounds latency.
+        "max_tokens": int(os.getenv("OLLAMA_MAX_TOKENS", "1024")),
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(user_input)},
         ],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": schema,
-        },
     }
-
     try:
-        with httpx.Client(timeout=float(os.getenv("GEMINI_VIVA_TIMEOUT_SECONDS", "45"))) as client:
-            response = client.post(
-                url,
-                headers={
-                    "x-goog-api-key": api_key,
-                    "Content-Type": "application/json",
-                },
-                json=request,
-            )
+        with httpx.Client(timeout=float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))) as client:
+            response = client.post(f"{ollama_host()}/v1/chat/completions", json=body)
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        raise GeminiAgentError(f"Gemini request failed: {exc}") from exc
-
-    text = extract_response_text(response.json())
+        raise OllamaAgentError(f"Ollama request failed: {exc}") from exc
     try:
-        return json.loads(text)
+        content = response.json()["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise OllamaAgentError("Ollama response was malformed") from exc
+    try:
+        return json.loads(content)
     except json.JSONDecodeError as exc:
-        raise GeminiAgentError(f"Gemini response was not valid JSON: {text[:300]}") from exc
-
-
-def extract_response_text(data: dict[str, Any]) -> str:
-    try:
-        return data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise GeminiAgentError("Gemini response did not include text output") from exc
+        raise OllamaAgentError(f"Ollama response was not valid JSON: {content[:300]}") from exc
 
 
 def trim(value: str, limit: int) -> str:
