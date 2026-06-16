@@ -204,6 +204,19 @@ export function getCsrfToken() {
   return window.localStorage.getItem("twelve_csrf") ?? "";
 }
 
+/** Operational status of the AI examiner (full vs degraded to local fallback). */
+export type AiHealth = {
+  provider: string;
+  degraded: boolean;
+  mode: "full" | "local-fallback" | string;
+  since: string | null;
+};
+
+/** Poll the AI examiner health; drives the student degraded-mode banner + auto-recovery. */
+export async function getAiHealth() {
+  return api<AiHealth>("/api/ai/health");
+}
+
 /** Fetch the current authenticated identity (staff or student) and roles. */
 export async function getMe() {
   return api<Me>("/api/auth/me");
@@ -227,17 +240,139 @@ export async function logout() {
   return api<{ ok: boolean; role: "staff" | "student" | null }>("/api/auth/logout", { method: "POST" });
 }
 
-/** Invite an additional staff member (super_admin only). */
+/** A staff account in the directory. */
+export type StaffMember = {
+  id: string;
+  email: string;
+  name: string;
+  roles: StaffRole[];
+  active: boolean;
+  created_at?: string;
+};
+
+/** Directory of all staff accounts (any signed-in staff may view). */
+export async function listStaff() {
+  return api<StaffMember[]>("/api/auth/staff");
+}
+
+/** Invite an additional staff member (any signed-in staff). */
 export async function createStaff(input: {
   email: string;
   name: string;
   password: string;
   roles: StaffRole[];
 }) {
-  return api<{ id: string; email: string; name: string; roles: StaffRole[] }>("/api/auth/staff", {
+  return api<StaffMember>("/api/auth/staff", {
     method: "POST",
     body: JSON.stringify(input),
   });
+}
+
+/** Edit an existing staff member's roles or active status (any signed-in staff). */
+export async function updateStaff(id: string, input: { roles?: StaffRole[]; active?: boolean }) {
+  return api<StaffMember>(`/api/auth/staff/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Edit an existing exam's definition (super_admin / exam_admin). Omitted fields stay as-is;
+ * pass an empty string for starts_at/ends_at to clear that window bound. */
+export async function updateExam(
+  id: string,
+  input: {
+    name?: string;
+    problem_statement?: string;
+    curriculum?: string;
+    rubric?: string;
+    mark_mode?: "professor_approved" | "ai_official";
+    starts_at?: string;
+    ends_at?: string;
+  }
+) {
+  return api<Exam>(`/api/admin/exams/${id}`, { method: "PATCH", body: JSON.stringify(input) });
+}
+
+// --- class-level review + exam management -----------------------------------
+
+/** An exam row in the class-level review overview, with attempt counts. */
+export type ReviewExam = {
+  id: string;
+  name: string;
+  status?: string;
+  mark_mode?: string;
+  created_at?: string;
+  archived: boolean;
+  archived_at?: string | null;
+  student_count: number;
+  taken_count: number;
+  completed_count: number;
+};
+
+/** One student's row in an exam's class roster. */
+export type ClassRosterEntry = {
+  student_id: string;
+  roll_number: string;
+  name: string;
+  email?: string | null;
+  attempt_status: "not_started" | "active" | "completed" | string;
+  session_id: string | null;
+  final_score: number | null;
+  effective_score: number | null;
+  started_at: string | null;
+  ended_at: string | null;
+};
+
+export type ExamClass = {
+  exam: { id: string; name: string; mark_mode?: string; archived: boolean };
+  student_count: number;
+  taken_count: number;
+  completed_count: number;
+  roster: ClassRosterEntry[];
+};
+
+export type ExamAssignment = {
+  id: string;
+  email: string;
+  name: string;
+  roles: StaffRole[];
+  created_at?: string;
+};
+
+/** Class-level review overview: exams the staffer can access + attempt counts. */
+export async function listReviewExams(includeArchived = false) {
+  return api<ReviewExam[]>(`/api/review/exams${includeArchived ? "?include_archived=true" : ""}`);
+}
+
+/** Whole-class roster for one exam (every enrolled student + their attempt status/score). */
+export async function getExamClass(examId: string) {
+  return api<ExamClass>(`/api/review/exams/${examId}/class`);
+}
+
+/** Archive (file away) / unarchive an exam. */
+export async function archiveExam(examId: string) {
+  return api<Exam>(`/api/admin/exams/${examId}/archive`, { method: "POST" });
+}
+export async function unarchiveExam(examId: string) {
+  return api<Exam>(`/api/admin/exams/${examId}/unarchive`, { method: "POST" });
+}
+
+/** Active staff that can be assigned to an exam. */
+export async function listAssignableStaff() {
+  return api<ExamAssignment[]>("/api/admin/assignable-staff");
+}
+/** Staff currently assigned to an exam. */
+export async function listExamAssignments(examId: string) {
+  return api<ExamAssignment[]>(`/api/admin/exams/${examId}/assignments`);
+}
+export async function assignStaff(examId: string, userId: string) {
+  return api<ExamAssignment[]>(`/api/admin/exams/${examId}/assignments`, {
+    method: "POST",
+    body: JSON.stringify({ user_id: userId }),
+  });
+}
+export async function unassignStaff(examId: string, userId: string) {
+  return api<ExamAssignment[]>(`/api/admin/exams/${examId}/assignments/${userId}`, { method: "DELETE" });
 }
 
 export function makeIdempotencyKey() {
