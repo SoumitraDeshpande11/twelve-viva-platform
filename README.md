@@ -7,7 +7,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![Next.js 16](https://img.shields.io/badge/Next.js%2016-000000?logo=nextdotjs&logoColor=white)](https://nextjs.org/)
 [![Docker Compose](https://img.shields.io/badge/Docker%20Compose-2496ED?logo=docker&logoColor=white)](https://docs.docker.com/compose/)
-[![pytest](https://img.shields.io/badge/pytest%20·%2015%20passing-3776AB?logo=pytest&logoColor=white)](backend/tests)
+[![pytest](https://img.shields.io/badge/pytest%20·%2067%20passing-3776AB?logo=pytest&logoColor=white)](backend/tests)
 [![License](https://img.shields.io/badge/Pilot-Browser--only-6E56CF)](#architecture--boundaries)
 
 <br/>
@@ -56,10 +56,15 @@ TWELVE runs an end-to-end viva (oral exam) in the browser. An administrator sets
 | --- | --- |
 | **Exam setup** | CSV roster, rubric, problem statement, curriculum, and PDF/DOCX/ZIP/TXT submissions indexed as viva context. |
 | **One-time access** | Per-student exam codes (shown once at creation), roll-number verification, optional **time windows** (`opens at` / `closes at`). |
-| **AI questioning** | Five-question plan generated per student; one follow-up decided per base question. OpenAI, Gemini, a local **Ollama** model (e.g. `llama3.2:3b`), or a deterministic local fallback. |
-| **Answers** | Spoken (server-side transcription — OpenAI, Gemini, or local **faster-whisper**) or typed, with idempotent submission and per-question scoring against the rubric. |
+| **AI questioning** | Five-question plan generated per student; one follow-up decided per base question. OpenAI, Gemini, a local **Ollama** model (e.g. `llama3.2:3b` / `qwen3:8b`), or a deterministic local fallback. |
+| **Provider failover** | If the configured AI errors (e.g. Gemini `429` / quota), scoring **auto-fails over to the next available provider** (typically the always-local Ollama) before ever dropping to the deterministic scorer. A heartbeat (`GET /api/ai/health`) surfaces a "backup mode" banner to the student only when *all* AI is down, and auto-clears on recovery. |
+| **Deep scoring** | Each answer gets an examiner-grade breakdown — multi-sentence reasoning, expected-points covered/missed, per-rubric-criterion judgement, and concerns — shown in review. |
+| **Answers** | Spoken (server-side transcription — OpenAI, Gemini, or local **faster-whisper**) or typed, with idempotent submission and per-question scoring against the rubric. The student **explicitly submits** the viva for review (no silent auto-finalize). |
 | **Proctoring** | Logs tab switch, blur, fullscreen exit, camera/mic loss, screen-share stop, no/multiple faces. Live **fullscreen / leave-window gates** and a lightweight **lighting check** prompt the student. Audit-only — never affects the score. |
 | **Viva recording** | The whole viva is recorded (camera video + audio) and replayed by the examiner in a **Recording** tab. Review-only — never scored. |
+| **Class-level review** | Review opens on an **exam list** with a "taken X / N students" count per exam; clicking through shows the **whole-class roster** (including students who haven't started) before drilling into a single student's record. |
+| **Exam management** | Edit an existing exam's definition (name, problem statement, curriculum, rubric, mark mode, window) and **archive** finished exams to file them away (hidden by default, retrievable). |
+| **Staff & assignment** | Super-admin staff directory (invite, edit roles, deactivate). Exams can be **assigned to staff**, scoping examiners/invigilators to only the exams they're assigned to; admins see all. |
 | **Professor review** | Transcripts, answer scores + reasoning, proctoring timeline, secure audio + video playback, and score overrides. |
 | **Score authority** | `mark_mode` drives an `official` / `provisional` status: AI-official on completion, or provisional until a professor approves. Overrides surface an `effective_score` without mutating the AI audit value. |
 | **Recovery** | Staff can re-score answers stuck on an AI error and re-transcribe failed audio (which re-syncs the answer and re-scores it). |
@@ -140,12 +145,14 @@ Set a long, random `TWELVE_SECRET_KEY` — it HMACs opaque session and student-i
 
 ### AI providers
 
-`TWELVE_AI_PROVIDER` is `auto` | `openai` | `gemini` | `ollama` | `local`. In `auto`, OpenAI is used if `OPENAI_API_KEY` is set, otherwise Gemini if `GEMINI_API_KEY` is set, otherwise the local fallback. The provider used is recorded in transcript events and scoring runs. In `local` / `development` / `test`, a provider failure (incl. Ollama unreachable) falls back to the deterministic local scorer; in staging/production a scoring failure records `pending_ai_error` for professor review or retry instead of inventing a grade.
+`TWELVE_AI_PROVIDER` is `auto` | `openai` | `gemini` | `ollama` | `local`. In `auto`, OpenAI is used if `OPENAI_API_KEY` is set, otherwise Gemini if `GEMINI_API_KEY` is set, otherwise the local fallback. The provider used is recorded in transcript events and scoring runs.
+
+**Automatic failover.** The configured provider is tried first, then the other available providers in turn (the always-local Ollama is the natural failover), so a transient error — a Gemini `429`/quota, a network blip — hands off to a working AI instead of silently dropping to the keyword scorer. Only if **every** AI fails does it fall back: in `local` / `development` / `test` to the deterministic local scorer; in staging/production it records `pending_ai_error` for professor review or retry instead of inventing a grade. `GET /api/ai/health` exposes whether scoring is currently degraded (drives the student "backup mode" banner) and re-probes the provider so it auto-recovers.
 
 ```bash
 TWELVE_AI_PROVIDER=auto
 OPENAI_VIVA_MODEL=gpt-5.5
-GEMINI_VIVA_MODEL=gemini-3.5-flash
+GEMINI_VIVA_MODEL=gemini-2.5-flash
 GEMINI_TTS_MODEL=gemini-3.1-flash-tts-preview
 GEMINI_TTS_VOICE=Kore
 ```
@@ -155,9 +162,11 @@ GEMINI_TTS_VOICE=Kore
 ```bash
 TWELVE_AI_PROVIDER=ollama
 OLLAMA_HOST=http://127.0.0.1:11434
-OLLAMA_MODEL=llama3.2:3b      # fits ~8 GB (M2) and a 6 GB GPU; pull with: ollama pull llama3.2:3b
+OLLAMA_MODEL=llama3.2:3b      # fast, fits ~8 GB (M2) / 6 GB GPU. Use qwen3:8b for deeper, slower scoring.
 OLLAMA_MAX_TOKENS=1024
 ```
+
+`qwen3:8b` gives noticeably richer breakdowns (it reasons before answering) at the cost of latency (~tens of seconds/answer on CPU); `llama3.2:3b` is much faster but shallower. Pull either with `ollama pull <model>`.
 
 A GPU is strongly recommended (CUDA on Linux, Metal on Apple Silicon): warm scoring is ~1–2 s on GPU vs ~2 min on CPU. Keep `ollama serve` running; `OLLAMA_KEEP_ALIVE=30m` keeps the model warm between answers.
 
@@ -189,7 +198,7 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-The suite (46 tests) covers the full viva flow, idempotent submission, exam time windows and mixed-offset validation, `mark_mode` official/provisional behaviour, score-override effective score and student privacy, override tie-break consistency, recovery from `pending_ai_error`, audio re-transcription re-syncing and re-scoring, logout audit events, transcription provider fallback (503/429 → local draft), viva recording upload / staff-only path-jailed serving / exam-delete cleanup, and Ollama + faster-whisper provider dispatch.
+The suite (67 tests) covers the full viva flow, explicit student submit/finalize, idempotent submission, exam time windows and mixed-offset validation, exam editing, exam archiving (hide/restore), staff invite/list/role-edit/deactivate with last-super-admin and self-lockout guards, exam→staff assignment and examiner access scoping, class-level review counts + roster (incl. not-started students), AI provider **failover** (Gemini error → Ollama) and degraded-mode health signalling, `mark_mode` official/provisional behaviour, score-override effective score and student privacy, override tie-break consistency, recovery from `pending_ai_error`, audio re-transcription re-syncing and re-scoring, logout audit events, transcription provider fallback (503/429 → local draft), viva recording upload (accepted on completion) / staff-only path-jailed serving / exam-delete cleanup, and Ollama + faster-whisper provider dispatch.
 
 ---
 

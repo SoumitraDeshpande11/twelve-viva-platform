@@ -1,8 +1,8 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
-import { CheckCircle as CheckCircle2, Archive as FileArchive, Key as KeyRound, ArrowsClockwise as RefreshCcw, UploadSimple as Upload, Users, Trash as Trash2, Copy, DownloadSimple as Download } from "@phosphor-icons/react";
-import { api, createStaff, getMe, Exam, Student, StaffRole } from "../../lib/api";
+import { CheckCircle as CheckCircle2, Archive as FileArchive, Key as KeyRound, ArrowsClockwise as RefreshCcw, UploadSimple as Upload, Users, Trash as Trash2, Copy, DownloadSimple as Download, PencilSimple as Pencil, FloppyDisk as Save, X } from "@phosphor-icons/react";
+import { api, createStaff, listStaff, updateStaff, getMe, updateExam, listExamAssignments, listAssignableStaff, assignStaff, unassignStaff, Exam, Student, StaffRole, StaffMember, ExamAssignment } from "../../lib/api";
 import { AuthPanel } from "../AuthPanel";
 import { PageHeading } from "../../components/AppShell";
 import { Card, SectionTitle } from "../../components/ui/Card";
@@ -12,6 +12,7 @@ import { Select } from "../../components/ui/Select";
 import { FileDrop } from "../../components/ui/FileDrop";
 import { Banner } from "../../components/ui/Banner";
 import { StatusPill } from "../../components/ui/Pill";
+import { cn } from "../../lib/cn";
 
 // create_exam may now return CSV parse diagnostics alongside the exam.
 type CreatedExam = Exam & { skipped_rows?: number; warnings?: string[] };
@@ -26,9 +27,25 @@ const STAFF_ROLES: { value: StaffRole; label: string }[] = [
   { value: "invigilator", label: "Invigilator" },
 ];
 
+/** Convert a stored ISO timestamp to the `YYYY-MM-DDTHH:mm` a datetime-local input wants
+ * (in the admin's local timezone). Returns "" for missing/invalid values. */
+function toLocalInput(iso?: string | null): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+}
+
 export default function AdminPage() {
   const [exams, setExams] = useState<Exam[]>([]);
   const [selected, setSelected] = useState<Exam | null>(null);
+  // Per-exam staff assignment (for the currently selected exam).
+  const [assignments, setAssignments] = useState<ExamAssignment[]>([]);
+  const [assignable, setAssignable] = useState<ExamAssignment[]>([]);
+  const [assignPick, setAssignPick] = useState("");
+  const [assignBusy, setAssignBusy] = useState(false);
+  const [assignRowBusy, setAssignRowBusy] = useState<string | null>(null);
+  const [assignError, setAssignError] = useState("");
   const [markMode, setMarkMode] = useState("professor_approved");
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
@@ -43,8 +60,20 @@ export default function AdminPage() {
   const [csvDiagnostics, setCsvDiagnostics] = useState<{ skipped: number; warnings: string[] } | null>(null);
   const [resettingId, setResettingId] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
-  // Current staff identity — drives whether the "Invite staff member" card shows.
-  const [isSuperAdmin, setIsSuperAdmin] = useState(false);
+  // Inline edit of the selected exam's definition (text/config fields only).
+  const [editing, setEditing] = useState(false);
+  const [editBusy, setEditBusy] = useState(false);
+  const [editMsg, setEditMsg] = useState("");
+  const [editErr, setEditErr] = useState(false);
+  const [editForm, setEditForm] = useState({
+    name: "",
+    problem_statement: "",
+    curriculum: "",
+    rubric: "",
+    mark_mode: "professor_approved",
+    starts_at: "",
+    ends_at: "",
+  });
   // Invite staff member form state.
   const [staffName, setStaffName] = useState("");
   const [staffEmail, setStaffEmail] = useState("");
@@ -53,6 +82,19 @@ export default function AdminPage() {
   const [staffBusy, setStaffBusy] = useState(false);
   const [staffMessage, setStaffMessage] = useState("");
   const [staffError, setStaffError] = useState(false);
+  // Staff directory + management (super_admin only).
+  const [isSuperAdmin, setIsSuperAdmin] = useState(false);
+  const [staffList, setStaffList] = useState<StaffMember[]>([]);
+  const [staffRowBusy, setStaffRowBusy] = useState<string | null>(null);
+  const [myUserId, setMyUserId] = useState<string | null>(null);
+
+  async function loadStaff() {
+    try {
+      setStaffList(await listStaff());
+    } catch {
+      // Non-fatal: the directory just stays empty if it can't load.
+    }
+  }
 
   async function loadExams() {
     const data = await api<Exam[]>("/api/admin/exams");
@@ -76,11 +118,72 @@ export default function AdminPage() {
     }
   }
 
+  // Load assigned + assignable staff whenever the selected exam changes.
+  useEffect(() => {
+    const examId = selected?.id;
+    if (!examId) {
+      setAssignments([]);
+      setAssignable([]);
+      setAssignPick("");
+      return;
+    }
+    let cancelled = false;
+    setAssignError("");
+    setAssignPick("");
+    Promise.all([listExamAssignments(examId), listAssignableStaff()])
+      .then(([assigned, all]) => {
+        if (cancelled) return;
+        setAssignments(assigned);
+        setAssignable(all);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setAssignments([]);
+        setAssignable([]);
+        setAssignError(error instanceof Error ? error.message : "Failed to load staff assignments.");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selected?.id]);
+
+  async function assignSelectedStaff() {
+    if (!selected || !assignPick) return;
+    setAssignBusy(true);
+    setAssignError("");
+    try {
+      const updated = await assignStaff(selected.id, assignPick);
+      setAssignments(updated);
+      setAssignPick("");
+    } catch (error) {
+      setAssignError(error instanceof Error ? error.message : "Failed to assign staff member.");
+    } finally {
+      setAssignBusy(false);
+    }
+  }
+
+  async function removeAssignedStaff(member: ExamAssignment) {
+    if (!selected) return;
+    setAssignRowBusy(member.id);
+    setAssignError("");
+    try {
+      const updated = await unassignStaff(selected.id, member.id);
+      setAssignments(updated);
+    } catch (error) {
+      setAssignError(error instanceof Error ? error.message : "Failed to remove staff member.");
+    } finally {
+      setAssignRowBusy(null);
+    }
+  }
+
   useEffect(() => {
     // Separate auth failure (show login) from data-load failure (stay, show banner).
     getMe()
       .then((identity) => {
-        setIsSuperAdmin(identity.role === "staff" && identity.roles.includes("super_admin"));
+        const superAdmin = identity.role === "staff" && identity.roles.includes("super_admin");
+        setIsSuperAdmin(superAdmin);
+        setMyUserId(identity.role === "staff" ? identity.user.id : null);
+        if (superAdmin) void loadStaff();
         return loadExams().catch((error) =>
           setLoadError(error instanceof Error ? error.message : "Failed to load exams.")
         );
@@ -155,6 +258,52 @@ export default function AdminPage() {
       setLoadError(error instanceof Error ? error.message : "Failed to delete exam.");
     } finally {
       setDeletingId(null);
+    }
+  }
+
+  function openEdit() {
+    if (!selected) return;
+    setEditForm({
+      name: selected.name ?? "",
+      problem_statement: selected.problem_statement ?? "",
+      curriculum: selected.curriculum ?? "",
+      rubric: selected.rubric ?? "",
+      mark_mode: selected.mark_mode ?? "professor_approved",
+      starts_at: toLocalInput(selected.starts_at),
+      ends_at: toLocalInput(selected.ends_at),
+    });
+    setEditMsg("");
+    setEditErr(false);
+    setEditing(true);
+  }
+
+  async function saveEdit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selected) return;
+    setEditBusy(true);
+    setEditMsg("");
+    setEditErr(false);
+    try {
+      const updated = await updateExam(selected.id, {
+        name: editForm.name,
+        problem_statement: editForm.problem_statement,
+        curriculum: editForm.curriculum,
+        rubric: editForm.rubric,
+        mark_mode: editForm.mark_mode as "professor_approved" | "ai_official",
+        starts_at: editForm.starts_at,
+        ends_at: editForm.ends_at,
+      });
+      // Preserve any one-time tokens already on the selected exam (PATCH redacts them).
+      setSelected((current) =>
+        current ? { ...updated, students: current.students, submissions: current.submissions } : updated
+      );
+      setExams((current) => current.map((item) => (item.id === updated.id ? { ...item, ...updated } : item)));
+      setEditing(false);
+    } catch (error) {
+      setEditErr(true);
+      setEditMsg(error instanceof Error ? error.message : "Failed to update exam.");
+    } finally {
+      setEditBusy(false);
     }
   }
 
@@ -238,6 +387,7 @@ export default function AdminPage() {
       setStaffEmail("");
       setStaffPassword("");
       setStaffRoles(["examiner"]);
+      void loadStaff();
     } catch (error) {
       setStaffError(true);
       setStaffMessage(error instanceof Error ? error.message : "Failed to create staff member.");
@@ -246,15 +396,45 @@ export default function AdminPage() {
     }
   }
 
+  async function applyStaffUpdate(member: StaffMember, input: { roles?: StaffRole[]; active?: boolean }) {
+    setStaffRowBusy(member.id);
+    setStaffError(false);
+    setStaffMessage("");
+    try {
+      const updated = await updateStaff(member.id, input);
+      setStaffList((list) => list.map((m) => (m.id === member.id ? updated : m)));
+    } catch (error) {
+      setStaffError(true);
+      setStaffMessage(error instanceof Error ? error.message : "Failed to update staff member.");
+    } finally {
+      setStaffRowBusy(null);
+    }
+  }
+
+  function toggleRoleFor(member: StaffMember, role: StaffRole) {
+    const roles = member.roles.includes(role)
+      ? member.roles.filter((r) => r !== role)
+      : [...member.roles, role];
+    if (roles.length === 0) {
+      setStaffError(true);
+      setStaffMessage("A staff member needs at least one role.");
+      return;
+    }
+    void applyStaffUpdate(member, { roles });
+  }
+
   if (needsAuth) {
     return (
       <AuthPanel
         onReady={() => {
           setNeedsAuth(false);
           getMe()
-            .then((identity) =>
-              setIsSuperAdmin(identity.role === "staff" && identity.roles.includes("super_admin"))
-            )
+            .then((identity) => {
+              const superAdmin = identity.role === "staff" && identity.roles.includes("super_admin");
+              setIsSuperAdmin(superAdmin);
+              setMyUserId(identity.role === "staff" ? identity.user.id : null);
+              if (superAdmin) void loadStaff();
+            })
             .catch(() => undefined);
           loadExams().catch((error) =>
             setLoadError(error instanceof Error ? error.message : "Failed to load exams.")
@@ -383,20 +563,23 @@ export default function AdminPage() {
 
         <Card className="reveal h-fit p-6" style={{ animationDelay: "80ms" }}>
           <SectionTitle marker="№ 02" title="Created Exams" />
+
           <div className="mt-5 flex flex-col gap-2">
             {exams.map((exam) => (
               <div
                 key={exam.id}
-                className={`flex items-stretch gap-2 rounded-[var(--radius-control)] border transition-colors ${
+                className={cn(
+                  "flex items-stretch gap-2 rounded-[var(--radius-control)] border transition-colors",
                   selected?.id === exam.id
                     ? "border-accent/50 bg-accent-soft"
                     : "border-line bg-surface-2/40 hover:border-accent/30"
-                }`}
+                )}
               >
                 <button
                   type="button"
                   onClick={async () => {
                     setLoadError("");
+                    setEditing(false); // close any open edit form when switching exams
                     try {
                       setSelected(await api<Exam>(`/api/admin/exams/${exam.id}`));
                     } catch (error) {
@@ -431,13 +614,82 @@ export default function AdminPage() {
           </div>
 
           {isSuperAdmin && (
-            <div className="mt-6 border-t border-line pt-6">
-              <SectionTitle
-                marker="№ 03"
-                title="Invite staff member"
-                hint="Create another staff account. Super-admin only."
-              />
-              <form onSubmit={inviteStaff} className="mt-5">
+          <div className="mt-6 border-t border-line pt-6">
+            <SectionTitle
+              marker="№ 03"
+              title="Staff"
+              hint="Create new staff accounts and manage roles. Super-admin only."
+            />
+
+            {/* Directory of existing staff: edit roles inline, activate/deactivate. */}
+            {staffList.length > 0 && (
+              <div className="mt-4 flex flex-col gap-2">
+                {staffList.map((member) => {
+                  const busy = staffRowBusy === member.id;
+                  return (
+                    <div
+                      key={member.id}
+                      className={cn(
+                        "rounded-[var(--radius-control)] border border-line bg-surface-2/40 px-3.5 py-3",
+                        !member.active && "opacity-60"
+                      )}
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="truncate text-[0.88rem] text-ink">
+                            {member.name}
+                            {member.id === myUserId && (
+                              <span className="ml-1.5 text-[0.72rem] text-muted">(you)</span>
+                            )}
+                          </p>
+                          <p className="truncate text-[0.76rem] text-muted">{member.email}</p>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-2">
+                          {!member.active && <StatusPill tone="danger">Inactive</StatusPill>}
+                          <Button
+                            size="sm"
+                            variant={member.active ? "secondary" : "primary"}
+                            disabled={busy || member.id === myUserId}
+                            title={member.id === myUserId ? "You cannot deactivate your own account" : undefined}
+                            onClick={() => applyStaffUpdate(member, { active: !member.active })}
+                          >
+                            {member.active ? "Deactivate" : "Activate"}
+                          </Button>
+                        </div>
+                      </div>
+                      <div className="mt-2.5 flex flex-wrap gap-1.5">
+                        {STAFF_ROLES.map((role) => {
+                          const on = member.roles.includes(role.value);
+                          return (
+                            <button
+                              key={role.value}
+                              type="button"
+                              disabled={busy}
+                              aria-pressed={on}
+                              onClick={() => toggleRoleFor(member, role.value)}
+                              className={cn(
+                                "rounded-full border px-2.5 py-1 text-[0.74rem] font-medium transition-colors disabled:opacity-50",
+                                on
+                                  ? "border-accent/40 bg-accent-soft text-accent"
+                                  : "border-line-strong bg-surface text-ink-soft hover:border-accent/40 hover:text-accent"
+                              )}
+                            >
+                              {role.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            <div className="mt-6 border-t border-line pt-5">
+              <p className="mb-3 text-[0.78rem] font-medium uppercase tracking-[0.16em] text-muted">
+                Invite new staff
+              </p>
+              <form onSubmit={inviteStaff} className="mt-1">
                 <Field label="Name" htmlFor="staff_name">
                   <Input
                     id="staff_name"
@@ -508,6 +760,7 @@ export default function AdminPage() {
                 )}
               </form>
             </div>
+          </div>
           )}
         </Card>
       </div>
@@ -522,7 +775,106 @@ export default function AdminPage() {
                 {selected.mark_mode === "ai_official" ? "AI official" : "Professor approved"}
               </StatusPill>
             )}
+            {!editing && (
+              <Button size="sm" variant="secondary" className="ml-auto" onClick={openEdit}>
+                <Pencil size={14} /> Edit exam
+              </Button>
+            )}
           </div>
+
+          {editing && (
+            <form onSubmit={saveEdit} className="mt-5 rounded-[var(--radius-control)] border border-line bg-surface-2/40 p-5">
+              <div className="mb-4 flex items-center justify-between">
+                <SectionTitle marker="✎" title="Edit exam" />
+                <button
+                  type="button"
+                  onClick={() => setEditing(false)}
+                  aria-label="Cancel editing"
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-line-strong text-ink-soft transition-colors hover:border-accent/40 hover:text-accent"
+                >
+                  <X size={15} />
+                </button>
+              </div>
+              <Field label="Exam name" htmlFor="edit_name">
+                <Input
+                  id="edit_name"
+                  value={editForm.name}
+                  onChange={(e) => setEditForm((f) => ({ ...f, name: e.target.value }))}
+                  required
+                />
+              </Field>
+              <Field label="Problem statement" htmlFor="edit_problem_statement">
+                <Textarea
+                  id="edit_problem_statement"
+                  value={editForm.problem_statement}
+                  onChange={(e) => setEditForm((f) => ({ ...f, problem_statement: e.target.value }))}
+                  required
+                />
+              </Field>
+              <Field label="Curriculum / topics" htmlFor="edit_curriculum">
+                <Textarea
+                  id="edit_curriculum"
+                  value={editForm.curriculum}
+                  onChange={(e) => setEditForm((f) => ({ ...f, curriculum: e.target.value }))}
+                  required
+                />
+              </Field>
+              <Field label="Rubric" htmlFor="edit_rubric">
+                <Textarea
+                  id="edit_rubric"
+                  value={editForm.rubric}
+                  onChange={(e) => setEditForm((f) => ({ ...f, rubric: e.target.value }))}
+                  required
+                />
+              </Field>
+              <Field label="Mark mode" htmlFor="edit_mark_mode">
+                <Select
+                  id="edit_mark_mode"
+                  value={editForm.mark_mode}
+                  onValueChange={(v) => setEditForm((f) => ({ ...f, mark_mode: v }))}
+                  options={[
+                    { value: "professor_approved", label: "Professor approved" },
+                    { value: "ai_official", label: "AI official unless overridden" },
+                  ]}
+                />
+              </Field>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Field label="Opens at (optional)" htmlFor="edit_starts_at">
+                  <Input
+                    id="edit_starts_at"
+                    type="datetime-local"
+                    value={editForm.starts_at}
+                    onChange={(e) => setEditForm((f) => ({ ...f, starts_at: e.target.value }))}
+                  />
+                </Field>
+                <Field label="Closes at (optional)" htmlFor="edit_ends_at">
+                  <Input
+                    id="edit_ends_at"
+                    type="datetime-local"
+                    value={editForm.ends_at}
+                    onChange={(e) => setEditForm((f) => ({ ...f, ends_at: e.target.value }))}
+                  />
+                </Field>
+              </div>
+              <p className="mb-3 text-[0.76rem] text-muted">
+                Edits apply to future vivas. Already-scored answers keep their marks — changing the
+                rubric does not re-score completed attempts.
+              </p>
+              <div className="flex gap-2">
+                <Button variant="primary" type="submit" disabled={editBusy}>
+                  <Save size={15} /> {editBusy ? "Saving…" : "Save changes"}
+                </Button>
+                <Button variant="ghost" type="button" onClick={() => setEditing(false)} disabled={editBusy}>
+                  Cancel
+                </Button>
+              </div>
+              {editMsg && (
+                <div className="mt-3">
+                  <Banner tone={editErr ? "danger" : "ok"}>{editMsg}</Banner>
+                </div>
+              )}
+            </form>
+          )}
 
           <div className="mt-6 grid gap-6 md:grid-cols-2">
             <div>
@@ -598,6 +950,86 @@ export default function AdminPage() {
                 )}
               </div>
             </div>
+          </div>
+
+          <div className="mt-6 border-t border-line pt-6">
+            <SectionTitle
+              marker="№ 05"
+              title="Assigned staff"
+              hint="Staff assigned to this exam can review its attempts. Super-admin / exam-admin only."
+            />
+
+            {assignError && (
+              <div className="mt-3">
+                <Banner tone="danger">{assignError}</Banner>
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-col gap-2">
+              {assignments.map((member) => {
+                const busy = assignRowBusy === member.id;
+                const roleLabels = member.roles
+                  .map((role) => STAFF_ROLES.find((item) => item.value === role)?.label ?? role)
+                  .join(", ");
+                return (
+                  <div
+                    key={member.id}
+                    className="flex items-center justify-between gap-3 rounded-[var(--radius-control)] border border-line bg-surface-2/40 px-3.5 py-2.5"
+                  >
+                    <div className="min-w-0">
+                      <p className="truncate text-[0.86rem] text-ink">{member.name}</p>
+                      <p className="truncate text-[0.76rem] text-muted">
+                        {member.email}
+                        {roleLabels && <span> · {roleLabels}</span>}
+                      </p>
+                    </div>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      disabled={busy}
+                      onClick={() => void removeAssignedStaff(member)}
+                    >
+                      {busy ? "Removing…" : "Remove"}
+                    </Button>
+                  </div>
+                );
+              })}
+              {!assignments.length && !assignError && (
+                <p className="text-[0.82rem] text-muted">No staff assigned yet.</p>
+              )}
+            </div>
+
+            {(() => {
+              const assignedIds = new Set(assignments.map((member) => member.id));
+              const available = assignable.filter((member) => !assignedIds.has(member.id));
+              return (
+                <div className="mt-4 flex flex-wrap items-end gap-2">
+                  <div className="min-w-[14rem] flex-1">
+                    <Field label="Assign staff member" htmlFor="assign_staff">
+                      <Select
+                        id="assign_staff"
+                        value={assignPick}
+                        onValueChange={setAssignPick}
+                        placeholder={available.length ? "Choose a staff member…" : "No staff available"}
+                        options={available.map((member) => ({
+                          value: member.id,
+                          label: `${member.name} · ${member.email}`,
+                        }))}
+                      />
+                    </Field>
+                  </div>
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    className="mb-4"
+                    disabled={assignBusy || !assignPick || !available.length}
+                    onClick={() => void assignSelectedStaff()}
+                  >
+                    <Users size={14} /> {assignBusy ? "Assigning…" : "Assign"}
+                  </Button>
+                </div>
+              );
+            })()}
           </div>
         </Card>
       )}

@@ -235,6 +235,8 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     add_column(conn, "exams", "mark_mode", "TEXT NOT NULL DEFAULT 'professor_approved'")
     add_column(conn, "exams", "starts_at", "TEXT")
     add_column(conn, "exams", "ends_at", "TEXT")
+    # Archived exams are filed away (hidden from default lists) but retained + retrievable.
+    add_column(conn, "exams", "archived_at", "TEXT")
 
     add_column(conn, "students", "token_hash", "TEXT")
     add_column(conn, "students", "token_issued_at", "TEXT")
@@ -284,6 +286,21 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_session_recordings_session ON session_recordings(session_id, created_at)")
+
+    # Which staff are assigned to (responsible for) an exam. Examiners/invigilators only
+    # see exams assigned to them; admins (super_admin/exam_admin) see and assign all.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS exam_assignments (
+            exam_id TEXT NOT NULL REFERENCES exams(id) ON DELETE CASCADE,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            assigned_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (exam_id, user_id)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_exam_assignments_user ON exam_assignments(user_id)")
 
 
 def add_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:

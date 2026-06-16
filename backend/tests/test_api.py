@@ -57,6 +57,9 @@ def complete_viva(sc, scsrf):
             return cur
         qid = cur.get("current_question_id")
         if not qid:
+            # All questions answered; the viva is no longer auto-finalized — the student
+            # explicitly submits it for review.
+            sc.post(f"/api/sessions/{cur['id']}/finalize", headers={"X-CSRF-Token": scsrf})
             break
         sc.post(
             "/api/student/attempts/current/answers",
@@ -430,13 +433,13 @@ def test_staff_cannot_take_viva(client):
     assert "Staff" in r.json()["detail"]
 
 
-def test_create_staff_requires_super_admin_and_creates_loginable_user(client, fresh_client):
+def test_create_staff_requires_staff_and_creates_loginable_user(client, fresh_client):
     csrf = bootstrap(client)
     # Anonymous (no staff cookie) cannot create staff.
     assert fresh_client.post("/api/auth/staff", json={
         "email": "x@e.edu", "name": "X", "password": "longpassword12345", "roles": ["examiner"],
     }).status_code in (401, 403)
-    # super_admin can, with CSRF.
+    # Any signed-in staff can, with CSRF.
     r = client.post("/api/auth/staff", json={
         "email": "exam@e.edu", "name": "Examiner", "password": "longpassword12345", "roles": ["examiner"],
     }, headers={"X-CSRF-Token": csrf})
@@ -444,6 +447,71 @@ def test_create_staff_requires_super_admin_and_creates_loginable_user(client, fr
     assert r.json()["roles"] == ["examiner"]
     # The new account can log in.
     assert fresh_client.post("/api/auth/login", json={"email": "exam@e.edu", "password": "longpassword12345"}).status_code == 200
+
+
+def _login(c, email, password="longpassword12345"):
+    r = c.post("/api/auth/login", json={"email": email, "password": password})
+    assert r.status_code == 200, r.text
+    return r.json()["csrf_token"]
+
+
+def test_non_superadmin_staff_cannot_manage_staff(client, fresh_client):
+    csrf = bootstrap(client)
+    # Create a plain examiner, then log in as them in a fresh jar.
+    client.post("/api/auth/staff", json={
+        "email": "ex@e.edu", "name": "Ex", "password": "longpassword12345", "roles": ["examiner"],
+    }, headers={"X-CSRF-Token": csrf})
+    ex_csrf = _login(fresh_client, "ex@e.edu")
+    # Account/role management stays super_admin only: examiner is rejected on every staff route.
+    assert fresh_client.get("/api/auth/staff").status_code == 403
+    assert fresh_client.post("/api/auth/staff", json={
+        "email": "inv@e.edu", "name": "Inv", "password": "longpassword12345", "roles": ["invigilator"],
+    }, headers={"X-CSRF-Token": ex_csrf}).status_code == 403
+
+
+def test_list_staff_returns_directory(client):
+    csrf = bootstrap(client)
+    client.post("/api/auth/staff", json={
+        "email": "ex@e.edu", "name": "Ex", "password": "longpassword12345", "roles": ["examiner"],
+    }, headers={"X-CSRF-Token": csrf})
+    rows = client.get("/api/auth/staff").json()
+    assert len(rows) == 2
+    examiner = next(r for r in rows if r["email"] == "ex@e.edu")
+    assert examiner["roles"] == ["examiner"]
+    assert examiner["active"] is True
+
+
+def test_update_staff_changes_roles_and_deactivates(client, fresh_client):
+    csrf = bootstrap(client)
+    created = client.post("/api/auth/staff", json={
+        "email": "ex@e.edu", "name": "Ex", "password": "longpassword12345", "roles": ["examiner"],
+    }, headers={"X-CSRF-Token": csrf}).json()
+    uid = created["id"]
+    # Change roles.
+    r = client.patch(f"/api/auth/staff/{uid}", json={"roles": ["exam_admin", "invigilator"]}, headers={"X-CSRF-Token": csrf})
+    assert r.status_code == 200, r.text
+    assert sorted(r.json()["roles"]) == ["exam_admin", "invigilator"]
+    # Deactivate -> the account can no longer log in, and live sessions are revoked.
+    assert fresh_client.post("/api/auth/login", json={"email": "ex@e.edu", "password": "longpassword12345"}).status_code == 200
+    r = client.patch(f"/api/auth/staff/{uid}", json={"active": False}, headers={"X-CSRF-Token": csrf})
+    assert r.status_code == 200 and r.json()["active"] is False
+    assert fresh_client.post("/api/auth/login", json={"email": "ex@e.edu", "password": "longpassword12345"}).status_code == 401
+
+
+def test_update_staff_cannot_remove_last_super_admin(client):
+    csrf = bootstrap(client)  # the bootstrap user is the only super_admin
+    me = client.get("/api/auth/me").json()
+    uid = me["user"]["id"]
+    # Demoting the last super admin is blocked.
+    assert client.patch(f"/api/auth/staff/{uid}", json={"roles": ["examiner"]}, headers={"X-CSRF-Token": csrf}).status_code == 400
+    # Self-deactivation is blocked.
+    assert client.patch(f"/api/auth/staff/{uid}", json={"active": False}, headers={"X-CSRF-Token": csrf}).status_code == 400
+
+
+def test_update_staff_requires_staff_and_exists(client, fresh_client):
+    csrf = bootstrap(client)
+    assert fresh_client.patch("/api/auth/staff/whoever", json={"active": False}).status_code in (401, 403)
+    assert client.patch("/api/auth/staff/missing", json={"active": False}, headers={"X-CSRF-Token": csrf}).status_code == 404
 
 
 def test_create_staff_rejects_unknown_roles(client):
@@ -614,11 +682,19 @@ def test_upload_recording_rejects_too_large(client, fresh_client, monkeypatch):
     assert r.status_code == 413
 
 
-def test_upload_recording_rejected_when_not_active(client, fresh_client):
+def test_upload_recording_accepted_when_completed(client, fresh_client):
+    # The full-viva recording is flushed at the END of the viva, by which point the
+    # session is already `completed`. That is the normal upload path, so it must succeed
+    # (regression: an active-only check previously 409'd every real recording upload).
     csrf, exam_id, session_id = setup_completed_session(client, fresh_client)
     scsrf = fresh_client.get("/api/auth/me").json()["csrf_token"]
     r = upload_recording(fresh_client, scsrf)
-    assert r.status_code == 409
+    assert r.status_code == 200, r.text
+    with main.connect() as conn:
+        row = conn.execute(
+            "SELECT session_id FROM session_recordings WHERE id = ?", (r.json()["recording_id"],)
+        ).fetchone()
+    assert row and row[0] == session_id
 
 
 def test_review_recording_rejects_out_of_jail_and_missing(client):
@@ -729,3 +805,228 @@ def test_logout_without_session_is_noop(client):
     assert r.json() == {"ok": True, "role": None}
     assert audit_events("staff_logout") == []
     assert audit_events("student_logout") == []
+
+
+# --- AI provider health / degraded-mode signalling --------------------------
+
+def _reset_ai_health():
+    main._ai_health.update(degraded=False, since=None, last_error=None, _last_probe=0.0)
+
+
+def test_ai_health_reports_full_by_default(client):
+    _reset_ai_health()
+    body = client.get("/api/ai/health").json()
+    assert body["degraded"] is False
+    assert body["mode"] == "full"
+
+
+def test_ai_health_degrades_on_fallback_and_recovers(client, monkeypatch):
+    _reset_ai_health()
+    # A dispatcher returning the local fallback means the configured provider failed.
+    main.note_provider_outcome("local-fallback", "gemini boom")
+    body = client.get("/api/ai/health").json()
+    assert body["degraded"] is True
+    assert body["mode"] == "local-fallback"
+    assert body["since"]
+
+    # The heartbeat endpoint re-probes the provider; once it returns healthy, the flag clears.
+    monkeypatch.setattr(main, "probe_active_provider", lambda: True)
+    main._ai_health["_last_probe"] = 0.0  # bypass the probe throttle for the test
+    body2 = client.get("/api/ai/health").json()
+    assert body2["degraded"] is False
+    assert body2["mode"] == "full"
+
+
+def test_ai_health_stays_degraded_while_provider_down(client, monkeypatch):
+    _reset_ai_health()
+    main.note_provider_outcome("local-fallback", "still down")
+    monkeypatch.setattr(main, "probe_active_provider", lambda: False)
+    main._ai_health["_last_probe"] = 0.0
+    assert client.get("/api/ai/health").json()["degraded"] is True
+
+
+def test_note_provider_outcome_ignores_plain_local(client):
+    # A provider intentionally set to local has nothing to degrade.
+    _reset_ai_health()
+    main.note_provider_outcome("local", None)
+    assert client.get("/api/ai/health").json()["degraded"] is False
+
+
+# --- exam editing -----------------------------------------------------------
+
+def test_update_exam_edits_fields(client):
+    csrf = bootstrap(client)
+    exam = create_exam(client, csrf).json()
+    r = client.patch(
+        f"/api/admin/exams/{exam['id']}",
+        json={"name": "Renamed Viva", "rubric": "New rubric weights", "mark_mode": "ai_official"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["name"] == "Renamed Viva"
+    assert body["rubric"] == "New rubric weights"
+    assert body["mark_mode"] == "ai_official"
+    # Untouched field preserved.
+    assert body["problem_statement"] == exam["problem_statement"]
+
+
+def test_update_exam_rejects_blank_and_bad_mark_mode(client):
+    csrf = bootstrap(client)
+    exam = create_exam(client, csrf).json()
+    assert client.patch(
+        f"/api/admin/exams/{exam['id']}", json={"name": "   "}, headers={"X-CSRF-Token": csrf}
+    ).status_code == 400
+    assert client.patch(
+        f"/api/admin/exams/{exam['id']}", json={"mark_mode": "nonsense"}, headers={"X-CSRF-Token": csrf}
+    ).status_code == 400
+
+
+def test_update_exam_rejects_inverted_window(client):
+    csrf = bootstrap(client)
+    exam = create_exam(client, csrf).json()
+    r = client.patch(
+        f"/api/admin/exams/{exam['id']}",
+        json={"starts_at": "2030-01-02T10:00", "ends_at": "2030-01-01T10:00"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 400
+
+
+def test_update_exam_requires_staff_and_exists(client, fresh_client):
+    csrf = bootstrap(client)
+    exam = create_exam(client, csrf).json()
+    # Anonymous client cannot edit.
+    assert fresh_client.patch(
+        f"/api/admin/exams/{exam['id']}", json={"name": "x"}
+    ).status_code in (401, 403)
+    # Missing exam → 404.
+    assert client.patch(
+        "/api/admin/exams/does-not-exist", json={"name": "x"}, headers={"X-CSRF-Token": csrf}
+    ).status_code == 404
+
+
+# --- exam archiving, assignment, access scoping -----------------------------
+
+def test_archive_hides_exam_from_default_list_and_unarchive_restores(client):
+    csrf = bootstrap(client)
+    exam = create_exam(client, csrf).json()
+    eid = exam["id"]
+    assert client.post(f"/api/admin/exams/{eid}/archive", headers={"X-CSRF-Token": csrf}).status_code == 200
+    # Default admin list excludes archived; include_archived shows it.
+    assert eid not in [e["id"] for e in client.get("/api/admin/exams").json()]
+    assert eid in [e["id"] for e in client.get("/api/admin/exams?include_archived=true").json()]
+    # Default review list also excludes it.
+    assert eid not in [e["id"] for e in client.get("/api/review/exams").json()]
+    # Unarchive restores.
+    assert client.post(f"/api/admin/exams/{eid}/unarchive", headers={"X-CSRF-Token": csrf}).status_code == 200
+    assert eid in [e["id"] for e in client.get("/api/admin/exams").json()]
+
+
+def test_review_exams_reports_taken_counts(client, fresh_client):
+    csrf, exam_id, session_id = setup_completed_session(client, fresh_client)
+    row = next(e for e in client.get("/api/review/exams").json() if e["id"] == exam_id)
+    assert row["student_count"] == 1
+    assert row["taken_count"] == 1
+    assert row["completed_count"] == 1
+
+
+def test_review_class_lists_all_students_including_not_started(client, fresh_client):
+    csrf = bootstrap(client)
+    # Two students; only one takes the viva.
+    csv = b"roll_number,name,email\n23X001,Asha,a@e.edu\n23X002,Vikram,v@e.edu\n"
+    exam = client.post(
+        "/api/admin/exams",
+        data={"name": "Class Exam", "problem_statement": "p", "curriculum": "c", "rubric": "Correctness 100%", "mark_mode": "professor_approved"},
+        files={"student_csv": ("s.csv", csv, "text/csv")},
+        headers={"X-CSRF-Token": csrf},
+    ).json()
+    code = next(s["token"] for s in exam["students"] if s["roll_number"] == "23X001")
+    start = start_attempt(fresh_client, exam["id"], code, roll="23X001").json()
+    complete_viva(fresh_client, start["csrf_token"])
+
+    body = client.get(f"/api/review/exams/{exam['id']}/class").json()
+    assert body["student_count"] == 2
+    assert body["taken_count"] == 1
+    statuses = {r["roll_number"]: r["attempt_status"] for r in body["roster"]}
+    assert statuses["23X001"] == "completed"
+    assert statuses["23X002"] == "not_started"
+
+
+def test_assignment_scopes_examiner_to_assigned_exams(client, fresh_client):
+    csrf = bootstrap(client)
+    exam_a = create_exam(client, csrf, roll="23A001").json()
+    exam_b = create_exam(client, csrf, roll="23B001").json()
+    # Create an examiner and log in (fresh jar).
+    examiner = client.post("/api/auth/staff", json={
+        "email": "ex@e.edu", "name": "Ex", "password": "longpassword12345", "roles": ["examiner"],
+    }, headers={"X-CSRF-Token": csrf}).json()
+    _login(fresh_client, "ex@e.edu")
+
+    # Unassigned examiner sees no exams in review and is blocked from exam B's class.
+    assert fresh_client.get("/api/review/exams").json() == []
+    assert fresh_client.get(f"/api/review/exams/{exam_b['id']}/class").status_code == 403
+
+    # Assign examiner to exam A only.
+    r = client.post(f"/api/admin/exams/{exam_a['id']}/assignments", json={"user_id": examiner["id"]}, headers={"X-CSRF-Token": csrf})
+    assert r.status_code == 200
+    assert examiner["id"] in [a["id"] for a in r.json()]
+
+    seen = [e["id"] for e in fresh_client.get("/api/review/exams").json()]
+    assert seen == [exam_a["id"]]
+    assert fresh_client.get(f"/api/review/exams/{exam_a['id']}/class").status_code == 200
+    assert fresh_client.get(f"/api/review/exams/{exam_b['id']}/class").status_code == 403
+
+
+def test_admin_sees_all_exams_regardless_of_assignment(client):
+    csrf = bootstrap(client)
+    create_exam(client, csrf, roll="23A001")
+    create_exam(client, csrf, roll="23B001")
+    # The bootstrap super_admin sees all exams in review without any assignment.
+    assert len(client.get("/api/review/exams").json()) == 2
+
+
+def test_assign_unassign_and_assignable_staff(client):
+    csrf = bootstrap(client)
+    exam = create_exam(client, csrf).json()
+    staff = client.post("/api/auth/staff", json={
+        "email": "ex@e.edu", "name": "Ex", "password": "longpassword12345", "roles": ["examiner"],
+    }, headers={"X-CSRF-Token": csrf}).json()
+    assert staff["id"] in [s["id"] for s in client.get("/api/admin/assignable-staff").json()]
+    client.post(f"/api/admin/exams/{exam['id']}/assignments", json={"user_id": staff["id"]}, headers={"X-CSRF-Token": csrf})
+    assert client.get(f"/api/admin/exams/{exam['id']}/assignments").json()[0]["id"] == staff["id"]
+    r = client.request("DELETE", f"/api/admin/exams/{exam['id']}/assignments/{staff['id']}", headers={"X-CSRF-Token": csrf})
+    assert r.status_code == 200 and r.json() == []
+
+
+# --- AI provider failover ---------------------------------------------------
+
+def _raise(exc):
+    def _fn(*a, **k):
+        raise exc
+    return _fn
+
+
+def test_score_fails_over_gemini_to_ollama(monkeypatch):
+    monkeypatch.setenv("TWELVE_AI_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "x")  # makes gemini_configured() true
+    monkeypatch.setattr(main, "score_answer_with_gemini", _raise(main.GeminiAgentError("429 Too Many Requests")))
+    monkeypatch.setattr(main, "score_answer_with_ollama", lambda *a, **k: {"score": 9.0, "max_score": 10.0, "reasoning": "ok"})
+    q = {"category": "design", "text": "Q", "expected_points": []}
+    exam = {"name": "E", "problem_statement": "p", "curriculum": "c", "rubric": "r"}
+    result, provider, err = main.score_current_answer(q, "answer", exam)
+    assert provider == "ollama"          # auto-failed over, not local
+    assert result["score"] == 9.0
+    assert err and "gemini" in err       # the gemini failure is recorded
+
+
+def test_score_failover_to_local_when_all_ai_fail(monkeypatch):
+    monkeypatch.setenv("TWELVE_AI_PROVIDER", "ollama")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(main, "score_answer_with_ollama", _raise(main.OllamaAgentError("connection refused")))
+    q = {"category": "design", "text": "Q", "expected_points": []}
+    exam = {"name": "E", "problem_statement": "p", "curriculum": "c", "rubric": "r"}
+    result, provider, err = main.score_current_answer(q, "answer", exam)
+    assert provider == "local-fallback"  # only after every AI failed
+    assert err and "ollama" in err

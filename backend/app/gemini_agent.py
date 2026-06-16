@@ -20,6 +20,28 @@ def gemini_configured() -> bool:
     return bool(os.getenv("GEMINI_API_KEY"))
 
 
+def gemini_health_check() -> None:
+    """Lightweight connectivity probe for recovery detection: a tiny generateContent call.
+
+    Raises GeminiAgentError if the key is missing or the endpoint is unreachable/erroring,
+    so the caller can tell whether Gemini is back. Kept cheap (1 output token, short timeout)."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise GeminiAgentError("GEMINI_API_KEY is not configured")
+    model = os.getenv("GEMINI_VIVA_MODEL", DEFAULT_MODEL)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    body = {
+        "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+        "generationConfig": {"maxOutputTokens": 1},
+    }
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.post(url, params={"key": api_key}, json=body)
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise GeminiAgentError(f"Gemini health check failed: {exc}") from exc
+
+
 def build_question_plan_with_gemini(exam: dict[str, Any], student: dict[str, Any], submission_text: str) -> list[QuestionSeed]:
     payload = call_structured_response(
         schema={
@@ -85,24 +107,55 @@ def build_question_plan_with_gemini(exam: dict[str, Any], student: dict[str, Any
 
 
 def score_answer_with_gemini(question: dict[str, Any], answer_text: str, rubric: str, exam: dict[str, Any]) -> dict[str, Any]:
+    expected_points = [str(p) for p in question.get("expected_points", []) if str(p).strip()]
     payload = call_structured_response(
         schema={
             "type": "object",
-            "additionalProperties": False,
-            "required": ["score", "max_score", "reasoning"],
+            "required": [
+                "score",
+                "reasoning",
+                "expected_points_covered",
+                "expected_points_missed",
+                "rubric_breakdown",
+                "concerns",
+            ],
             "properties": {
                 "score": {"type": "number", "minimum": 0, "maximum": 10},
-                "max_score": {"type": "number"},
+                # A multi-sentence justification, not a one-liner.
                 "reasoning": {"type": "string"},
+                # Which expected points the student addressed (and which not).
+                "expected_points_covered": {"type": "array", "items": {"type": "string"}},
+                "expected_points_missed": {"type": "array", "items": {"type": "string"}},
+                # Per-rubric-criterion assessment.
+                "rubric_breakdown": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["criterion", "assessment"],
+                        "properties": {
+                            "criterion": {"type": "string"},
+                            "assessment": {"type": "string"},
+                        },
+                    },
+                },
+                # Specific weaknesses / gaps an examiner should look at.
+                "concerns": {"type": "array", "items": {"type": "string"}},
             },
         },
         instructions=(
-            "You are TWELVE's scoring specialist. Grade only the answer to the current question. "
-            "Use the rubric and expected points, but do not let proctoring or behavior affect marks. "
-            "Be strict, fair, and concise."
+            "You are TWELVE's scoring specialist for a BTech CSE project viva. Grade ONLY the answer "
+            "to the current question, out of 10, using the rubric and expected points. Do not let "
+            "proctoring or behaviour affect marks. Be strict and fair.\n"
+            "Produce an in-depth, examiner-grade evaluation:\n"
+            "- reasoning: 3-6 sentences. Quote or paraphrase what the student actually said, explain "
+            "what earned and what lost marks, and justify the exact number. Name concepts they got "
+            "right and any technical inaccuracies. Do NOT be generic.\n"
+            "- expected_points_covered / expected_points_missed: map each expected point to one bucket.\n"
+            "- rubric_breakdown: one entry per rubric criterion with a concrete one-line judgement.\n"
+            "- concerns: specific gaps, misconceptions, or unsupported claims (empty list if none)."
         ),
         user_input={
-            "task": "Score this viva answer out of 10.",
+            "task": "Score this viva answer out of 10 with a detailed breakdown.",
             "exam": {
                 "name": exam["name"],
                 "problem_statement": trim(exam["problem_statement"], 4000),
@@ -112,15 +165,35 @@ def score_answer_with_gemini(question: dict[str, Any], answer_text: str, rubric:
             "question": {
                 "category": question["category"],
                 "text": question["text"],
-                "expected_points": question.get("expected_points", []),
+                "expected_points": expected_points,
             },
             "student_answer": trim(answer_text, 10000),
         },
     )
+
+    def as_str_list(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    # Normalize rubric_breakdown (list of {criterion, assessment}) into a flat mapping for storage.
+    breakdown: dict[str, str] = {}
+    raw_breakdown = payload.get("rubric_breakdown")
+    if isinstance(raw_breakdown, list):
+        for entry in raw_breakdown:
+            if isinstance(entry, dict) and entry.get("criterion"):
+                breakdown[str(entry["criterion"]).strip()] = str(entry.get("assessment", "")).strip()
+    elif isinstance(raw_breakdown, dict):
+        breakdown = {str(k): str(v) for k, v in raw_breakdown.items()}
+
     return {
         "score": max(0.0, min(10.0, round(float(payload["score"]), 1))),
         "max_score": 10.0,
-        "reasoning": payload["reasoning"].strip(),
+        "reasoning": str(payload.get("reasoning", "")).strip(),
+        "rubric_breakdown": breakdown,
+        "expected_points_covered": as_str_list(payload.get("expected_points_covered")),
+        "expected_points_missed": as_str_list(payload.get("expected_points_missed")),
+        "concerns": as_str_list(payload.get("concerns")),
     }
 
 

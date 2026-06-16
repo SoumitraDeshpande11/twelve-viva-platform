@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import shutil
 import sqlite3
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -43,6 +44,7 @@ from .gemini_agent import (
     build_question_plan_with_gemini,
     create_followup_with_gemini,
     gemini_configured,
+    gemini_health_check,
     score_answer_with_gemini,
 )
 from .gemini_voice import GeminiVoiceError, create_live_ephemeral_token, gemini_tts_configured, synthesize_question_wav
@@ -51,6 +53,7 @@ from .ollama_agent import (
     build_question_plan_with_ollama,
     create_followup_with_ollama,
     ollama_configured,
+    ollama_health_check,
     ollama_model,
     score_answer_with_ollama,
 )
@@ -134,6 +137,16 @@ class CreateStaffRequest(BaseModel):
     roles: list[str]
 
 
+class UpdateStaffRequest(BaseModel):
+    """Edit an existing staff member. Omitted fields are left unchanged."""
+    roles: list[str] | None = None
+    active: bool | None = None
+
+
+class AssignStaffRequest(BaseModel):
+    user_id: str
+
+
 class AudioRefRequest(BaseModel):
     audio_ref: str
 
@@ -188,9 +201,21 @@ def bootstrap_admin(payload: BootstrapRequest, response: Response) -> dict[str, 
         return issue_staff_session(conn, response, user_id)
 
 
+@app.get("/api/auth/staff")
+def list_staff(request: Request) -> list[dict[str, Any]]:
+    """Directory of all staff accounts with their roles. super_admin only."""
+    require_staff(request, {"super_admin"})
+    with connect() as conn:
+        users = rows_to_dicts(conn.execute("SELECT id, email, name, active, created_at FROM users ORDER BY created_at"))
+        for user in users:
+            user["roles"] = sorted(row["role"] for row in conn.execute("SELECT role FROM user_roles WHERE user_id = ?", (user["id"],)))
+            user["active"] = bool(user["active"])
+    return users
+
+
 @app.post("/api/auth/staff")
 def create_staff(payload: CreateStaffRequest, request: Request) -> dict[str, Any]:
-    """Invite an additional staff member. super_admin only (CSRF enforced)."""
+    """Create a brand-new staff account. super_admin only (CSRF enforced)."""
     auth = require_staff(request, {"super_admin"})
     roles = [role for role in payload.roles if role in STAFF_ROLES]
     if not roles:
@@ -200,7 +225,57 @@ def create_staff(payload: CreateStaffRequest, request: Request) -> dict[str, Any
             raise HTTPException(status_code=409, detail="A user with that email already exists.")
         user_id = create_staff_user(conn, payload.email, payload.name, payload.password, roles)
         audit_event(conn, "staff", auth["user_id"], "staff_created", {"email": payload.email, "roles": roles})
-    return {"id": user_id, "email": payload.email.strip().lower(), "name": payload.name.strip(), "roles": roles}
+    return {"id": user_id, "email": payload.email.strip().lower(), "name": payload.name.strip(), "roles": roles, "active": True}
+
+
+@app.patch("/api/auth/staff/{user_id}")
+def update_staff(user_id: str, payload: UpdateStaffRequest, request: Request) -> dict[str, Any]:
+    """Edit an existing staff member's roles or active status. super_admin only.
+
+    Guards against locking everyone out: the last active super_admin cannot be demoted or
+    deactivated, and a staffer cannot deactivate their own account (self-lockout)."""
+    auth = require_staff(request, {"super_admin"})
+    with connect() as conn:
+        existing = row_to_dict(conn.execute("SELECT id, email, name, active FROM users WHERE id = ?", (user_id,)).fetchone())
+        if not existing:
+            raise HTTPException(status_code=404, detail="Staff member not found.")
+        current_roles = {row["role"] for row in conn.execute("SELECT role FROM user_roles WHERE user_id = ?", (user_id,))}
+        new_roles = current_roles
+        if payload.roles is not None:
+            new_roles = {role for role in payload.roles if role in STAFF_ROLES}
+            if not new_roles:
+                raise HTTPException(status_code=400, detail="At least one valid role is required.")
+        new_active = existing["active"] if payload.active is None else (1 if payload.active else 0)
+
+        if user_id == auth["user_id"] and new_active == 0:
+            raise HTTPException(status_code=400, detail="You cannot deactivate your own account.")
+
+        # Protect the last remaining active super_admin from being demoted/deactivated.
+        active_super_admins = {
+            row["user_id"]
+            for row in conn.execute(
+                "SELECT ur.user_id FROM user_roles ur JOIN users u ON u.id = ur.user_id WHERE ur.role = 'super_admin' AND u.active = 1"
+            )
+        }
+        was_active_super_admin = "super_admin" in current_roles and existing["active"] == 1
+        loses_super_admin = was_active_super_admin and ("super_admin" not in new_roles or new_active == 0)
+        if loses_super_admin and active_super_admins <= {user_id}:
+            raise HTTPException(status_code=400, detail="At least one active super admin must remain.")
+
+        if payload.roles is not None and new_roles != current_roles:
+            conn.execute("DELETE FROM user_roles WHERE user_id = ?", (user_id,))
+            for role in sorted(new_roles):
+                conn.execute("INSERT INTO user_roles (user_id, role) VALUES (?, ?)", (user_id, role))
+        if new_active != existing["active"]:
+            conn.execute("UPDATE users SET active = ? WHERE id = ?", (new_active, user_id))
+            if new_active == 0:
+                # Revoke any live sessions for a deactivated account so access ends immediately.
+                conn.execute("DELETE FROM auth_sessions WHERE user_id = ?", (user_id,))
+        audit_event(
+            conn, "staff", auth["user_id"], "staff_updated",
+            {"user_id": user_id, "roles": sorted(new_roles), "active": bool(new_active)},
+        )
+    return {"id": user_id, "email": existing["email"], "name": existing["name"], "roles": sorted(new_roles), "active": bool(new_active)}
 
 
 @app.post("/api/auth/login")
@@ -421,20 +496,186 @@ async def create_exam(
 
 
 @app.get("/api/admin/exams")
-def list_exams(request: Request) -> list[dict[str, Any]]:
+def list_exams(request: Request, include_archived: bool = False) -> list[dict[str, Any]]:
     require_staff(request, {"super_admin", "exam_admin", "examiner", "invigilator"})
     with connect() as conn:
         exams = rows_to_dicts(conn.execute("SELECT * FROM exams ORDER BY created_at DESC"))
+        out: list[dict[str, Any]] = []
         for exam in exams:
+            exam["archived"] = bool(exam.get("archived_at"))
+            if exam["archived"] and not include_archived:
+                continue
             exam["student_count"] = conn.execute("SELECT COUNT(*) FROM students WHERE exam_id = ?", (exam["id"],)).fetchone()[0]
             exam["session_count"] = conn.execute("SELECT COUNT(*) FROM viva_sessions WHERE exam_id = ?", (exam["id"],)).fetchone()[0]
-        return exams
+            out.append(exam)
+        return out
 
 
 @app.get("/api/admin/exams/{exam_id}")
 def get_exam(exam_id: str, request: Request) -> dict[str, Any]:
     require_staff(request, {"super_admin", "exam_admin", "examiner", "invigilator"})
     return get_exam_for_response(exam_id)
+
+
+class UpdateExamRequest(BaseModel):
+    """Partial update of an exam's definition. Omitted fields are left unchanged.
+    Roster (students) and submissions are NOT edited here — those have their own flows."""
+    name: str | None = None
+    problem_statement: str | None = None
+    curriculum: str | None = None
+    rubric: str | None = None
+    mark_mode: str | None = None
+    # Empty string clears the bound; a datetime-local string sets it.
+    starts_at: str | None = None
+    ends_at: str | None = None
+
+
+@app.patch("/api/admin/exams/{exam_id}")
+def update_exam(exam_id: str, payload: UpdateExamRequest, request: Request) -> dict[str, Any]:
+    """Edit an existing exam's text/config fields. Does not retro-change already-scored
+    answers (final score is answer-scores only) — new wording affects future vivas."""
+    auth = require_staff(request, {"super_admin", "exam_admin"})
+    with connect() as conn:
+        existing = row_to_dict(conn.execute("SELECT * FROM exams WHERE id = ?", (exam_id,)).fetchone())
+        if not existing:
+            raise HTTPException(status_code=404, detail="Exam not found")
+
+        updates: dict[str, Any] = {}
+        for field in ("name", "problem_statement", "curriculum", "rubric"):
+            value = getattr(payload, field)
+            if value is not None:
+                text = value.strip()
+                if not text:
+                    raise HTTPException(status_code=400, detail=f"{field.replace('_', ' ').capitalize()} cannot be empty.")
+                updates[field] = text
+
+        if payload.mark_mode is not None:
+            if payload.mark_mode not in {"professor_approved", "ai_official"}:
+                raise HTTPException(status_code=400, detail="Unsupported mark mode.")
+            updates["mark_mode"] = payload.mark_mode
+
+        # Window bounds: an explicit empty string clears the bound; otherwise normalize it.
+        starts_value = existing.get("starts_at")
+        ends_value = existing.get("ends_at")
+        if payload.starts_at is not None:
+            dt = normalize_window_bound(payload.starts_at, "starts_at") if payload.starts_at.strip() else None
+            starts_value = dt.isoformat() if dt else None
+            updates["starts_at"] = starts_value
+        if payload.ends_at is not None:
+            dt = normalize_window_bound(payload.ends_at, "ends_at") if payload.ends_at.strip() else None
+            ends_value = dt.isoformat() if dt else None
+            updates["ends_at"] = ends_value
+        if starts_value and ends_value and datetime.fromisoformat(ends_value) <= datetime.fromisoformat(starts_value):
+            raise HTTPException(status_code=400, detail="Exam end time must be after the start time.")
+
+        if updates:
+            set_clause = ", ".join(f"{key} = ?" for key in updates)
+            conn.execute(f"UPDATE exams SET {set_clause} WHERE id = ?", (*updates.values(), exam_id))
+            audit_event(conn, "staff", auth["user_id"], "exam_updated", {"exam_id": exam_id, "fields": list(updates.keys())})
+    return get_exam_for_response(exam_id)
+
+
+# --- Exam access scoping (assigned-staff model) ------------------------------
+ADMIN_ROLES = {"super_admin", "exam_admin"}
+
+
+def accessible_exam_ids(auth: dict[str, Any]) -> set[str] | None:
+    """Exam ids a staff user may access. None = all (admins). Examiners/invigilators are
+    limited to exams explicitly assigned to them."""
+    if set(auth.get("roles", [])) & ADMIN_ROLES:
+        return None
+    with connect() as conn:
+        return {row["exam_id"] for row in conn.execute("SELECT exam_id FROM exam_assignments WHERE user_id = ?", (auth["user_id"],))}
+
+
+def require_exam_access(auth: dict[str, Any], exam_id: str) -> None:
+    scope = accessible_exam_ids(auth)
+    if scope is not None and exam_id not in scope:
+        raise HTTPException(status_code=403, detail="You are not assigned to this exam.")
+
+
+@app.post("/api/admin/exams/{exam_id}/archive")
+def archive_exam(exam_id: str, request: Request) -> dict[str, Any]:
+    """File a finished exam away: hidden from default lists but retained and retrievable."""
+    auth = require_staff(request, ADMIN_ROLES)
+    with connect() as conn:
+        if not conn.execute("SELECT 1 FROM exams WHERE id = ?", (exam_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Exam not found")
+        conn.execute("UPDATE exams SET archived_at = ? WHERE id = ? AND archived_at IS NULL", (utc_now(), exam_id))
+        audit_event(conn, "staff", auth["user_id"], "exam_archived", {"exam_id": exam_id})
+    return get_exam_for_response(exam_id)
+
+
+@app.post("/api/admin/exams/{exam_id}/unarchive")
+def unarchive_exam(exam_id: str, request: Request) -> dict[str, Any]:
+    """Restore an archived exam back into the active lists."""
+    auth = require_staff(request, ADMIN_ROLES)
+    with connect() as conn:
+        if not conn.execute("SELECT 1 FROM exams WHERE id = ?", (exam_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Exam not found")
+        conn.execute("UPDATE exams SET archived_at = NULL WHERE id = ?", (exam_id,))
+        audit_event(conn, "staff", auth["user_id"], "exam_unarchived", {"exam_id": exam_id})
+    return get_exam_for_response(exam_id)
+
+
+@app.get("/api/admin/assignable-staff")
+def assignable_staff(request: Request) -> list[dict[str, Any]]:
+    """Active staff that can be assigned to an exam. Available to exam managers."""
+    require_staff(request, ADMIN_ROLES)
+    with connect() as conn:
+        users = rows_to_dicts(conn.execute("SELECT id, email, name FROM users WHERE active = 1 ORDER BY name"))
+        for user in users:
+            user["roles"] = sorted(row["role"] for row in conn.execute("SELECT role FROM user_roles WHERE user_id = ?", (user["id"],)))
+    return users
+
+
+@app.get("/api/admin/exams/{exam_id}/assignments")
+def list_exam_assignments(exam_id: str, request: Request) -> list[dict[str, Any]]:
+    """Staff currently assigned to an exam."""
+    require_staff(request, ADMIN_ROLES)
+    with connect() as conn:
+        if not conn.execute("SELECT 1 FROM exams WHERE id = ?", (exam_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Exam not found")
+        rows = rows_to_dicts(
+            conn.execute(
+                """
+                SELECT u.id, u.email, u.name, ea.created_at
+                FROM exam_assignments ea JOIN users u ON u.id = ea.user_id
+                WHERE ea.exam_id = ? ORDER BY u.name
+                """,
+                (exam_id,),
+            )
+        )
+        for row in rows:
+            row["roles"] = sorted(r["role"] for r in conn.execute("SELECT role FROM user_roles WHERE user_id = ?", (row["id"],)))
+    return rows
+
+
+@app.post("/api/admin/exams/{exam_id}/assignments")
+def assign_staff_to_exam(exam_id: str, payload: AssignStaffRequest, request: Request) -> list[dict[str, Any]]:
+    """Assign an existing staff member to an exam (idempotent)."""
+    auth = require_staff(request, ADMIN_ROLES)
+    with connect() as conn:
+        if not conn.execute("SELECT 1 FROM exams WHERE id = ?", (exam_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Exam not found")
+        if not conn.execute("SELECT 1 FROM users WHERE id = ? AND active = 1", (payload.user_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Staff member not found.")
+        conn.execute(
+            "INSERT OR IGNORE INTO exam_assignments (exam_id, user_id, assigned_by, created_at) VALUES (?, ?, ?, ?)",
+            (exam_id, payload.user_id, auth["user_id"], utc_now()),
+        )
+        audit_event(conn, "staff", auth["user_id"], "exam_staff_assigned", {"exam_id": exam_id, "user_id": payload.user_id})
+    return list_exam_assignments(exam_id, request)
+
+
+@app.delete("/api/admin/exams/{exam_id}/assignments/{user_id}")
+def unassign_staff_from_exam(exam_id: str, user_id: str, request: Request) -> list[dict[str, Any]]:
+    """Remove a staff member's assignment from an exam."""
+    auth = require_staff(request, ADMIN_ROLES)
+    with connect() as conn:
+        conn.execute("DELETE FROM exam_assignments WHERE exam_id = ? AND user_id = ?", (exam_id, user_id))
+        audit_event(conn, "staff", auth["user_id"], "exam_staff_unassigned", {"exam_id": exam_id, "user_id": user_id})
+    return list_exam_assignments(exam_id, request)
 
 
 @app.delete("/api/admin/exams/{exam_id}", status_code=204)
@@ -491,6 +732,7 @@ def get_exam_for_response(exam_id: str) -> dict[str, Any]:
         exam = row_to_dict(conn.execute("SELECT * FROM exams WHERE id = ?", (exam_id,)).fetchone())
         if not exam:
             raise HTTPException(status_code=404, detail="Exam not found")
+        exam["archived"] = bool(exam.get("archived_at"))
         exam["students"] = rows_to_dicts(
             conn.execute("SELECT id, roll_number, name, email, NULL AS token FROM students WHERE exam_id = ? ORDER BY roll_number", (exam_id,))
         )
@@ -582,6 +824,7 @@ def start_session(payload: StartSessionRequest, request: Request, response: Resp
             )
         )
         plan, agent_provider, agent_error = make_question_plan(exam, student, submission_text)
+        note_provider_outcome(agent_provider, agent_error)
         session_id = str(uuid.uuid4())
         now = utc_now()
         conn.execute(
@@ -732,6 +975,7 @@ def submit_answer_for_session(session_id: str, payload: AnswerRequest, request: 
         log_transcript(conn, session_id, "answer_received", {"question_id": payload.question_id, "answer_id": answer_id, "input_mode": payload.input_mode})
 
     result, scorer_provider, scorer_error = score_current_answer(question, answer_text, exam)
+    note_provider_outcome(scorer_provider, scorer_error)
     response_hash = hmac_hex(as_json(result))
     scoring_status = result.get("status", "scored")
 
@@ -807,6 +1051,7 @@ def submit_answer_for_session(session_id: str, payload: AnswerRequest, request: 
         )
 
         followup, followup_provider, followup_error = create_next_followup(question, answer_text, exam)
+        note_provider_outcome(followup_provider, followup_error)
         if followup_provider or followup_error:
             log_transcript(
                 conn,
@@ -852,11 +1097,11 @@ def submit_answer_for_session(session_id: str, payload: AnswerRequest, request: 
                 (next_question["id"] if next_question else None, session_id),
             )
 
-        updated = hydrate_session(conn, session_id)
-        if not updated["current_question"]:
-            finalize_session(conn, session_id)
-            updated = hydrate_session(conn, session_id)
-        return updated
+        # Do NOT auto-finalize when the last question is answered. The student must
+        # explicitly submit the viva (POST /finalize) via the "Submit viva for review"
+        # button, so the session stays `active` with current_question = null until then.
+        # This keeps a clear, deliberate completion step (and lets them review before sending).
+        return hydrate_session(conn, session_id)
 
 
 @app.post("/api/sessions/{session_id}/audio")
@@ -899,7 +1144,10 @@ async def store_session_recording(session_id: str, recording: UploadFile) -> dic
         session = row_to_dict(conn.execute("SELECT * FROM viva_sessions WHERE id = ?", (session_id,)).fetchone())
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
-        if session["status"] != "active":
+        # The full-viva recording is flushed at the END of the viva, so the session is
+        # normally already `completed` by the time this fires. Accept both active (mid-viva
+        # cap reached / early flush) and completed (the common case); reject anything else.
+        if session["status"] not in ("active", "completed"):
             raise HTTPException(status_code=409, detail="Session is not active")
     content = await recording.read()
     max_bytes = int(os.getenv("TWELVE_MAX_VIDEO_BYTES", str(500 * 1024 * 1024)))
@@ -1146,12 +1394,14 @@ def finalize(session_id: str, request: Request) -> dict[str, Any]:
 
 @app.post("/api/review/sessions/{session_id}/override")
 def create_score_review(session_id: str, payload: ReviewRequest, request: Request) -> dict[str, Any]:
-    require_staff(request, {"super_admin", "examiner"})
+    auth = require_staff(request, {"super_admin", "examiner"})
     if not payload.reason.strip():
         raise HTTPException(status_code=400, detail="Score override reason is required.")
     with connect() as conn:
-        if not conn.execute("SELECT 1 FROM viva_sessions WHERE id = ?", (session_id,)).fetchone():
+        target = row_to_dict(conn.execute("SELECT exam_id FROM viva_sessions WHERE id = ?", (session_id,)).fetchone())
+        if not target:
             raise HTTPException(status_code=404, detail="Session not found")
+        require_exam_access(auth, target["exam_id"])
         review = {
             "id": str(uuid.uuid4()),
             "session_id": session_id,
@@ -1242,6 +1492,7 @@ def recompute_answer_score(session_id: str, answer_id: str, request: Request) ->
         exam = row_to_dict(conn.execute("SELECT * FROM exams WHERE id = ?", (session["exam_id"],)).fetchone())
 
     result, scorer_provider, scorer_error = score_current_answer(question, answer["answer_text"], exam)
+    note_provider_outcome(scorer_provider, scorer_error)
 
     with connect() as conn:
         scoring_status, _ = persist_scoring(conn, answer_id, result, scorer_provider, scorer_error)
@@ -1337,9 +1588,101 @@ def retranscribe_audio(session_id: str, audio_id: str, request: Request) -> dict
     }
 
 
+REVIEW_ROLES = {"super_admin", "exam_admin", "examiner", "invigilator"}
+
+
+@app.get("/api/review/exams")
+def list_review_exams(request: Request, include_archived: bool = False) -> list[dict[str, Any]]:
+    """Class-level overview: every exam the staffer can access, with how many of its
+    enrolled students have taken / completed the viva. Archived exams are excluded by default.
+    Examiners/invigilators see only exams assigned to them; admins see all."""
+    auth = require_staff(request, REVIEW_ROLES)
+    scope = accessible_exam_ids(auth)
+    with connect() as conn:
+        exams = rows_to_dicts(conn.execute("SELECT * FROM exams ORDER BY archived_at IS NOT NULL, created_at DESC"))
+        result: list[dict[str, Any]] = []
+        for exam in exams:
+            if scope is not None and exam["id"] not in scope:
+                continue
+            if exam.get("archived_at") and not include_archived:
+                continue
+            student_count = conn.execute("SELECT COUNT(*) FROM students WHERE exam_id = ?", (exam["id"],)).fetchone()[0]
+            taken = conn.execute("SELECT COUNT(DISTINCT student_id) FROM viva_sessions WHERE exam_id = ?", (exam["id"],)).fetchone()[0]
+            completed = conn.execute(
+                "SELECT COUNT(DISTINCT student_id) FROM viva_sessions WHERE exam_id = ? AND status = 'completed'", (exam["id"],)
+            ).fetchone()[0]
+            result.append(
+                {
+                    "id": exam["id"],
+                    "name": exam["name"],
+                    "status": exam.get("status"),
+                    "mark_mode": exam.get("mark_mode"),
+                    "created_at": exam.get("created_at"),
+                    "archived": bool(exam.get("archived_at")),
+                    "archived_at": exam.get("archived_at"),
+                    "student_count": student_count,
+                    "taken_count": taken,
+                    "completed_count": completed,
+                }
+            )
+        return result
+
+
+@app.get("/api/review/exams/{exam_id}/class")
+def review_exam_class(exam_id: str, request: Request) -> dict[str, Any]:
+    """Whole-class roster for one exam: every enrolled student and their attempt status/score,
+    including students who have not started yet."""
+    auth = require_staff(request, REVIEW_ROLES)
+    require_exam_access(auth, exam_id)
+    with connect() as conn:
+        exam = row_to_dict(conn.execute("SELECT * FROM exams WHERE id = ?", (exam_id,)).fetchone())
+        if not exam:
+            raise HTTPException(status_code=404, detail="Exam not found")
+        students = rows_to_dicts(conn.execute("SELECT id, roll_number, name, email FROM students WHERE exam_id = ? ORDER BY roll_number", (exam_id,)))
+        roster: list[dict[str, Any]] = []
+        for student in students:
+            session = row_to_dict(
+                conn.execute(
+                    "SELECT * FROM viva_sessions WHERE exam_id = ? AND student_id = ? ORDER BY started_at DESC LIMIT 1",
+                    (exam_id, student["id"]),
+                ).fetchone()
+            )
+            entry = {
+                "student_id": student["id"],
+                "roll_number": student["roll_number"],
+                "name": student["name"],
+                "email": student.get("email"),
+                "attempt_status": "not_started",
+                "session_id": None,
+                "final_score": None,
+                "effective_score": None,
+                "started_at": None,
+                "ended_at": None,
+            }
+            if session:
+                meta = attach_session_list_metadata(conn, [dict(session)])[0]
+                entry.update(
+                    attempt_status=session["status"],
+                    session_id=session["id"],
+                    final_score=session.get("final_score"),
+                    effective_score=meta.get("effective_score"),
+                    started_at=session.get("started_at"),
+                    ended_at=session.get("ended_at"),
+                )
+            roster.append(entry)
+        return {
+            "exam": {"id": exam["id"], "name": exam["name"], "mark_mode": exam.get("mark_mode"), "archived": bool(exam.get("archived_at"))},
+            "student_count": len(students),
+            "taken_count": sum(1 for r in roster if r["attempt_status"] != "not_started"),
+            "completed_count": sum(1 for r in roster if r["attempt_status"] == "completed"),
+            "roster": roster,
+        }
+
+
 @app.get("/api/review/sessions")
 def list_review_sessions(request: Request) -> list[dict[str, Any]]:
-    require_staff(request, {"super_admin", "examiner", "invigilator"})
+    auth = require_staff(request, REVIEW_ROLES)
+    scope = accessible_exam_ids(auth)
     with connect() as conn:
         sessions = rows_to_dicts(
             conn.execute(
@@ -1352,19 +1695,26 @@ def list_review_sessions(request: Request) -> list[dict[str, Any]]:
                 """
             )
         )
+        if scope is not None:
+            sessions = [s for s in sessions if s["exam_id"] in scope]
         return attach_session_list_metadata(conn, sessions)
 
 
 @app.get("/api/review/sessions/{session_id}")
 def review_session(session_id: str, request: Request) -> dict[str, Any]:
-    require_staff(request, {"super_admin", "examiner", "invigilator"})
+    auth = require_staff(request, REVIEW_ROLES)
     with connect() as conn:
+        session = row_to_dict(conn.execute("SELECT exam_id FROM viva_sessions WHERE id = ?", (session_id,)).fetchone())
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        require_exam_access(auth, session["exam_id"])
         return hydrate_session(conn, session_id, include_private=True)
 
 
 @app.get("/api/review/exams/{exam_id}/sessions")
 def list_review_exam_sessions(exam_id: str, request: Request) -> list[dict[str, Any]]:
-    require_staff(request, {"super_admin", "examiner", "invigilator"})
+    auth = require_staff(request, REVIEW_ROLES)
+    require_exam_access(auth, exam_id)
     with connect() as conn:
         sessions = rows_to_dicts(
             conn.execute(
@@ -1664,71 +2014,162 @@ def infer_student_id(filename: str, student_ids: dict[str, str]) -> str | None:
     return None
 
 
-def make_question_plan(exam: dict[str, Any], student: dict[str, Any], submission_text: str) -> tuple[Any, str, str | None]:
+# --- AI provider health (degraded-mode signalling for the student UI) ---------
+# When the configured provider (e.g. Gemini) fails and we fall back to the local
+# scorer, we flip a process-wide "degraded" flag. The student UI polls
+# GET /api/ai/health on a heartbeat to show a banner, and that endpoint actively
+# re-probes the provider (throttled) so the flag clears the moment it recovers.
+AI_PROBE_INTERVAL_SECONDS = 12.0
+_ai_health: dict[str, Any] = {
+    "degraded": False,
+    "since": None,        # ISO timestamp degradation began
+    "last_error": None,
+    "_last_probe": 0.0,    # time.monotonic() of the last recovery probe
+}
+
+
+def record_ai_outcome(healthy: bool, error: str | None = None) -> None:
+    """Track whether the configured AI provider is serving (healthy) or we fell back."""
+    if healthy:
+        if _ai_health["degraded"]:
+            _ai_health.update(degraded=False, since=None, last_error=None)
+        return
+    if not _ai_health["degraded"]:
+        _ai_health.update(degraded=True, since=utc_now())
+    _ai_health["last_error"] = error
+
+
+def note_provider_outcome(provider_tag: str, error: str | None = None) -> None:
+    """Update AI health from a dispatcher's returned provider tag.
+
+    `local-fallback` means the configured AI provider failed and we degraded to the
+    local scorer; a real provider tag (gemini/openai/ollama) means it served. A plain
+    `local` tag (provider intentionally local) is ignored — there is nothing to degrade.
+    """
+    if provider_tag == "local-fallback":
+        record_ai_outcome(False, error)
+    elif provider_tag in ("gemini", "openai", "ollama"):
+        record_ai_outcome(True)
+
+
+def probe_active_provider() -> bool:
+    """Cheaply check whether the configured provider is reachable again."""
     provider = selected_ai_provider()
-    if provider == "openai":
+    try:
+        if provider == "gemini":
+            gemini_health_check()
+        elif provider == "ollama":
+            ollama_health_check()
+        else:
+            # No cheap probe for openai/local; assume recovery is detected on next score.
+            return not _ai_health["degraded"]
+        return True
+    except (GeminiAgentError, OllamaAgentError):
+        return False
+
+
+@app.get("/api/ai/health")
+def ai_health() -> dict[str, Any]:
+    """Operational status of the AI examiner, polled by the student heartbeat.
+
+    Reports whether scoring is degraded to the local fallback. When degraded, it
+    actively re-probes the configured provider (throttled to AI_PROBE_INTERVAL_SECONDS)
+    so the flag clears the instant the provider recovers — flipping the UI back to
+    full-AI mode without needing another answer to be scored.
+    """
+    provider = selected_ai_provider()
+    if _ai_health["degraded"]:
+        now = time.monotonic()
+        if now - _ai_health["_last_probe"] >= AI_PROBE_INTERVAL_SECONDS:
+            _ai_health["_last_probe"] = now
+            if probe_active_provider():
+                record_ai_outcome(True)
+    degraded = bool(_ai_health["degraded"])
+    return {
+        "provider": provider,
+        "degraded": degraded,
+        "mode": "local-fallback" if degraded else "full",
+        "since": _ai_health["since"],
+    }
+
+
+# Provider-specific error types; any of these triggers failover to the next provider.
+AI_AGENT_ERRORS = (OpenAIAgentError, GeminiAgentError, OllamaAgentError)
+
+
+def provider_attempt_order() -> list[str]:
+    """Ordered list of real AI providers to try before giving up to the local scorer.
+
+    The configured provider comes first, then the OTHER available providers as automatic
+    failovers — so a transient error (e.g. Gemini 429 / quota) hands off to a working AI
+    (typically the always-local Ollama) instead of silently dropping to the deterministic
+    keyword scorer. An explicit `local` selection opts out of all AI (returns []).
+    """
+    selected = selected_ai_provider()
+    if selected == "local":
+        return []
+    order: list[str] = []
+    for candidate in [selected, "ollama", "gemini", "openai"]:
+        if candidate in order or candidate == "local":
+            continue
+        if candidate == "gemini" and not gemini_configured():
+            continue
+        if candidate == "openai" and not openai_configured():
+            continue
+        if candidate == "ollama" and not ollama_configured():
+            continue
+        order.append(candidate)
+    return order
+
+
+def _local_tag() -> str:
+    """`local` when local is the deliberate choice, else `local-fallback` (AI failed)."""
+    return "local" if selected_ai_provider() == "local" else "local-fallback"
+
+
+def make_question_plan(exam: dict[str, Any], student: dict[str, Any], submission_text: str) -> tuple[Any, str, str | None]:
+    errors: list[str] = []
+    for provider in provider_attempt_order():
         try:
-            return build_question_plan_with_openai(exam, student, submission_text), "openai", None
-        except OpenAIAgentError as exc:
-            return build_question_plan(exam, student, submission_text), "local-fallback", str(exc)
-    if provider == "gemini":
-        try:
-            return build_question_plan_with_gemini(exam, student, submission_text), "gemini", None
-        except GeminiAgentError as exc:
-            return build_question_plan(exam, student, submission_text), "local-fallback", str(exc)
-    if provider == "ollama":
-        try:
-            return build_question_plan_with_ollama(exam, student, submission_text), "ollama", None
-        except OllamaAgentError as exc:
-            return build_question_plan(exam, student, submission_text), "local-fallback", str(exc)
-    return build_question_plan(exam, student, submission_text), "local", None
+            if provider == "openai":
+                plan = build_question_plan_with_openai(exam, student, submission_text)
+            elif provider == "gemini":
+                plan = build_question_plan_with_gemini(exam, student, submission_text)
+            else:
+                plan = build_question_plan_with_ollama(exam, student, submission_text)
+            return plan, provider, ("; ".join(errors) or None)
+        except AI_AGENT_ERRORS as exc:
+            errors.append(f"{provider}: {exc}")
+    return build_question_plan(exam, student, submission_text), _local_tag() if errors else "local", ("; ".join(errors) or None)
 
 
 def score_current_answer(question: dict[str, Any], answer_text: str, exam: dict[str, Any]) -> tuple[dict[str, Any], str, str | None]:
-    provider = selected_ai_provider()
-    if provider == "openai":
+    errors: list[str] = []
+    for provider in provider_attempt_order():
         try:
-            result = score_answer_with_openai(question, answer_text, exam["rubric"], exam)
+            if provider == "openai":
+                result = score_answer_with_openai(question, answer_text, exam["rubric"], exam)
+                result["model"] = os.getenv("OPENAI_VIVA_MODEL", "gpt-5.5")
+            elif provider == "gemini":
+                result = score_answer_with_gemini(question, answer_text, exam["rubric"], exam)
+                result["model"] = os.getenv("GEMINI_VIVA_MODEL", "gemini-2.5-flash")
+            else:
+                result = score_answer_with_ollama(question, answer_text, exam["rubric"], exam)
+                result["model"] = ollama_model()
             result["status"] = "scored"
-            result["model"] = os.getenv("OPENAI_VIVA_MODEL", "gpt-5.5")
-            return result, "openai", None
-        except OpenAIAgentError as exc:
-            if local_ai_allowed():
-                result = score_answer(question, answer_text, exam["rubric"])
-                result["status"] = "scored"
-                result["model"] = "local"
-                return result, "local-fallback", str(exc)
-            return pending_ai_error_result(str(exc)), "openai", str(exc)
-    if provider == "gemini":
-        try:
-            result = score_answer_with_gemini(question, answer_text, exam["rubric"], exam)
-            result["status"] = "scored"
-            result["model"] = os.getenv("GEMINI_VIVA_MODEL", "gemini-3.5-flash")
-            return result, "gemini", None
-        except GeminiAgentError as exc:
-            if local_ai_allowed():
-                result = score_answer(question, answer_text, exam["rubric"])
-                result["status"] = "scored"
-                result["model"] = "local"
-                return result, "local-fallback", str(exc)
-            return pending_ai_error_result(str(exc)), "gemini", str(exc)
-    if provider == "ollama":
-        try:
-            result = score_answer_with_ollama(question, answer_text, exam["rubric"], exam)
-            result["status"] = "scored"
-            result["model"] = ollama_model()
-            return result, "ollama", None
-        except OllamaAgentError as exc:
-            if local_ai_allowed():
-                result = score_answer(question, answer_text, exam["rubric"])
-                result["status"] = "scored"
-                result["model"] = "local"
-                return result, "local-fallback", str(exc)
-            return pending_ai_error_result(str(exc)), "ollama", str(exc)
-    result = score_answer(question, answer_text, exam["rubric"])
-    result["status"] = "scored"
-    result["model"] = "local"
-    return result, "local", None
+            return result, provider, ("; ".join(errors) or None)
+        except AI_AGENT_ERRORS as exc:
+            errors.append(f"{provider}: {exc}")
+
+    error_text = "; ".join(errors) or None
+    # All AI providers failed (or local was chosen). In local/dev/test fall back to the
+    # deterministic scorer; in staging/prod refuse to fabricate a mark.
+    if selected_ai_provider() == "local" or local_ai_allowed():
+        result = score_answer(question, answer_text, exam["rubric"])
+        result["status"] = "scored"
+        result["model"] = "local"
+        return result, _local_tag() if errors else "local", error_text
+    return pending_ai_error_result(error_text or "AI scoring failed"), selected_ai_provider(), error_text
 
 
 def pending_ai_error_result(error: str) -> dict[str, Any]:
@@ -1763,23 +2204,17 @@ def self_supplied_transcript_allowed() -> bool:
 def create_next_followup(question: dict[str, Any], answer_text: str, exam: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
     if question["category"] == "follow-up":
         return None, None, None
-    provider = selected_ai_provider()
-    if provider == "openai":
+    errors: list[str] = []
+    for provider in provider_attempt_order():
         try:
-            return create_followup_with_openai(question, answer_text, exam["rubric"]), "openai", None
-        except OpenAIAgentError as exc:
-            return create_followup(question, answer_text), "local-fallback", str(exc)
-    if provider == "gemini":
-        try:
-            return create_followup_with_gemini(question, answer_text, exam["rubric"]), "gemini", None
-        except GeminiAgentError as exc:
-            return create_followup(question, answer_text), "local-fallback", str(exc)
-    if provider == "ollama":
-        try:
-            return create_followup_with_ollama(question, answer_text, exam["rubric"]), "ollama", None
-        except OllamaAgentError as exc:
-            return create_followup(question, answer_text), "local-fallback", str(exc)
-    return create_followup(question, answer_text), "local", None
+            if provider == "openai":
+                return create_followup_with_openai(question, answer_text, exam["rubric"]), "openai", ("; ".join(errors) or None)
+            if provider == "gemini":
+                return create_followup_with_gemini(question, answer_text, exam["rubric"]), "gemini", ("; ".join(errors) or None)
+            return create_followup_with_ollama(question, answer_text, exam["rubric"]), "ollama", ("; ".join(errors) or None)
+        except AI_AGENT_ERRORS as exc:
+            errors.append(f"{provider}: {exc}")
+    return create_followup(question, answer_text), _local_tag() if errors else "local", ("; ".join(errors) or None)
 
 
 def selected_ai_provider() -> str:

@@ -31,6 +31,7 @@ import { useQuestionTts } from "./hooks/useQuestionTts";
 import { useVoiceRecorder } from "./hooks/useVoiceRecorder";
 import { useSessionRecorder } from "./hooks/useSessionRecorder";
 import { useFaceLighting } from "./hooks/useFaceLighting";
+import { useAiHealth } from "./hooks/useAiHealth";
 
 const CONSENT_TEXT =
   "I consent to browser proctoring flags, camera video and audio recording, transcripts, " +
@@ -87,6 +88,9 @@ export default function StudentPage() {
   // Lightweight check that the student's face is well lit in the camera preview, before
   // and during the viva (brightness sample, no heavy face/ML detection).
   const lighting = useFaceLighting(videoRef, mediaActive);
+  // Heartbeat on the AI examiner: surfaces a banner when scoring degrades to the local
+  // backup, and auto-clears when the provider reconnects.
+  const ai = useAiHealth(viva.session?.status === "active");
 
   // Destructure hook returns so member reads happen once here rather than during
   // JSX render — keeps the React-Compiler ref advisory quiet and the JSX terse.
@@ -301,6 +305,26 @@ export default function StudentPage() {
           <Button size="sm" variant="secondary" className="mt-2.5" onClick={() => recorder.retryUpload()}>
             Retry upload
           </Button>
+        </Banner>
+      )}
+
+      {ai.degraded && (
+        <Banner tone="warn" className="mb-4">
+          <p className="flex items-center gap-2 font-medium">
+            <span className="h-2 w-2 animate-pulse rounded-full bg-amber-500" aria-hidden />
+            AI examiner running in backup mode
+          </p>
+          <p className="mt-0.5">
+            The main AI is temporarily unavailable, so answers are scored by a local backup.
+            Scoring may be slower and less detailed. Keep going as normal — your answers are saved,
+            and we&apos;ll switch back to the full AI automatically the moment it reconnects.
+          </p>
+        </Banner>
+      )}
+
+      {ai.recovered && !ai.degraded && (
+        <Banner tone="info" className="mb-4">
+          <p className="font-medium">Full AI examiner reconnected — back to detailed scoring.</p>
         </Banner>
       )}
 
@@ -561,10 +585,13 @@ export default function StudentPage() {
                   </span>
                   <div>
                     <h2 className="text-xl text-ink">All questions answered</h2>
-                    <p className="mt-1 text-[0.85rem] text-muted">Finalize to send your viva for professor review.</p>
+                    <p className="mt-1 text-[0.85rem] text-muted">
+                      Review your answers if you like, then submit your viva for professor review.
+                      Nothing is sent until you press the button below.
+                    </p>
                   </div>
                   <Button variant="primary" onClick={viva.finalize} disabled={finalizing}>
-                    {finalizing ? "Finalizing…" : "Finalize score"}
+                    <Send size={15} /> {finalizing ? "Submitting…" : "Submit viva for review"}
                   </Button>
                 </div>
               )}
